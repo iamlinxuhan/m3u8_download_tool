@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+env/
+
+# Build, Distribute and Package
+build/
+dist/
+*.egg-info/
+*.egg
+*.spec
+
+# VS Code & Visual Studio
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# PyInstaller output (especially your .exe)
+# 忽略所有打包生成的exe，但保留源代码目录里的工具
+m3u8_download_2.0/dist/
+m3u8_download_2.0/build/
+*.exe
+!m3u8_download_2.0/tools/*.exe  # 这句表示不忽略tools文件夹下的exe
+
+# Your own tools directory (if you don't want to commit the tools)
+# tools/
+# 如果不想提交N_m3u8DL-CLI等工具，把上一行的注释#去掉
