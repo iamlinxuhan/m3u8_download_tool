@@ -1,0 +1,19 @@
+﻿LOG 2026/05/01
+Save Path: C:\Users\22766\m3u8_download_tool\m3u8_download_2.0\tools\Logs
+Task Start: 2026/05/01 00:41:18
+Task CommandLine: C:\Users\22766\m3u8_download_tool\m3u8_download_2.0\tools\N_m3u8DL-CLI_v3.0.2.exe F:/吝旭涵/学习资料/地史政生（小四科）/生物/video\temp_playlist_1777567276.m3u8 --workDir F:/吝旭涵/学习资料/地史政生（小四科）/生物/video --saveName 姐妹 --maxThreads 1024 --minThreads 64 --retryCount 99 --enableDelAfterDone
+
+00:41:18.047 / (NORMAL) 开始解析 F:/吝旭涵/学习资料/地史政生（小四科）/生物/video\temp_playlist_1777567276.m3u8
+00:41:18.101 / (NORMAL) 写出meta.json
+00:41:18.201 / (NORMAL) 开始下载文件
+00:41:19.301 / (NORMAL) 读取文件信息...
+00:41:19.853 / (NORMAL) PID 0x100: Video h264, yuv420p(progressive), 960x540 [SAR 1:1 DAR 16:9], 25 fps, 25 tbr, 90k tbn, 50 tbc
+00:41:19.854 / (NORMAL) PID 0x101: Audio aac, 44100 Hz, stereo, fltp, 4 kb/s
+00:43:49.525 / (NORMAL) 开始合并分片...
+00:43:51.336 / (NORMAL) 结果输出至 [ffreport.log]
+00:43:51.338 / (NORMAL) 任务结束
+
+Task End: 2026/05/01 00:43:51
+File: F:\吝旭涵\学习资料\地史政生（小四科）\生物\video\姐妹.mp4
+
+

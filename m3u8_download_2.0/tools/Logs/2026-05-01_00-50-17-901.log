@@ -1,0 +1,11 @@
+﻿LOG 2026/05/01
+Save Path: C:\Users\22766\m3u8_download_tool\m3u8_download_2.0\tools\Logs
+Task Start: 2026/05/01 00:50:17
+Task CommandLine: C:\Users\22766\m3u8_download_tool\m3u8_download_2.0\tools\N_m3u8DL-CLI_v3.0.2.exe https://cdn-m.asujp.com:59888/f/data8/5C48105FB74F6E1C/58310D1CDD62D7C6/play.m3u8?_KS=2095caa3cf0728a59b71fefc3628b8f2&_KE=1777517039 --workDir C:\Users\22766\Downloads\M3U8_Downloads --saveName output --maxThreads 1024 --minThreads 64 --retryCount 99 --enableDelAfterDone
+
+00:50:17.903 / (NORMAL) 开始解析 https://cdn-m.asujp.com:59888/f/data8/5C48105FB74F6E1C/58310D1CDD62D7C6/play.m3u8?_KS=2095caa3cf0728a59b71fefc3628b8f2&_KE=1777517039
+00:50:18.954 / (NORMAL) 写出meta.json
+00:50:19.032 / (NORMAL) 开始下载文件
+00:50:24.281 / (NORMAL) 读取文件信息...
+00:50:24.343 / (NORMAL) PID 0x100: Video h264, yuv420p(progressive), 960x540 [SAR 1:1 DAR 16:9], 25 fps, 25 tbr, 90k tbn, 50 tbc
+00:50:24.344 / (NORMAL) PID 0x101: Audio aac, 44100 Hz, stereo, fltp, 4 kb/s

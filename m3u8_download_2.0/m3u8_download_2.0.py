@@ -1,546 +1,307 @@
-﻿import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, filedialog
-import threading
-import subprocess
+# -*- coding: utf-8 -*-
+"""
+M3U8视频下载器 2.0 - PyQt5 版本
+功能：
+  - 双模式切换：M3U8/普通视频下载 + 视频格式转换
+  - M3U8下载策略与原版完全一致：
+      Step1 用 requests 下载 .m3u8 到本地临时文件
+      Step2 用 N_m3u8DL-CLI 消费临时文件，实时输出日志/进度
+  - 支持本地 .m3u8 文件导入（跳过 Step1，直接进 Step2）
+  - 当 URL 不是 .m3u8 时，可直接下载普通视频（requests 流式 + 断点续传）
+  - 下载后若输出格式与实际格式不同，自动调用 ffmpeg 转换
+  - 视频格式转换面板：ffmpeg，解析 time= 更新进度条
+  - 所有子进程均在后台线程中运行，不阻塞 UI
+  - 彩色日志（绿/红/黄/白），带时间戳
+  - PyInstaller 打包兼容（sys.frozen / sys._MEIPASS）
+"""
+
 import os
 import sys
 import re
+import threading
+import subprocess
+import time
+import math
 from datetime import datetime
-import requests
+from urllib.parse import urlparse
 
-class M3U8DownloaderGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("M3U8视频下载器")
-        self.root.geometry("900x650")
+# ─── PyQt5 导入 ────────────────────────────────────────────────────────────────
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QStackedWidget,
+    QMenuBar, QMenu, QAction, QStatusBar, QLabel, QLineEdit,
+    QPushButton, QComboBox, QSpinBox, QProgressBar, QTextEdit,
+    QFileDialog, QDialog, QDialogButtonBox, QFormLayout,
+    QHBoxLayout, QVBoxLayout, QGroupBox,
+    QMessageBox,
+)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt5.QtGui import (
+    QFont, QTextCursor, QTextCharFormat, QColor, QIcon, QPalette
+)
 
-        # 实例化下载器管理器
-        self.downloader_manager = DownloaderManager(self.log_message)
+# ─── 可选 requests ─────────────────────────────────────────────────────────────
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
-        # 检查必要库
-        self.check_dependencies()
 
-        # 设置样式
-        self.setup_styles()
+# ═══════════════════════════════════════════════════════════════════════════════
+# 工具函数
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        # 创建主框架
-        self.create_widgets()
+def get_base_dir() -> str:
+    """获取程序基础目录（兼容 PyInstaller）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
-        # 初始化下载状态
-        self.downloading = False
-        self.process = None
 
-    def check_dependencies(self):
-        """检查必要的依赖库"""
-        try:
-            import requests
-        except ImportError:
-            messagebox.showerror("缺少依赖", "请先安装requests库：\n\npip install requests")
-            self.root.quit()
+def get_tools_dir() -> str:
+    return os.path.join(get_base_dir(), "tools")
 
-    def setup_styles(self):
-        """设置界面样式"""
-        style = ttk.Style()
-        style.theme_use('clam')
 
-        # 自定义颜色
-        self.bg_color = "#f0f0f0"
-        self.primary_color = "#2196F3"
-        self.secondary_color = "#3F51B5"
-        self.success_color = "#4CAF50"
-        self.warning_color = "#FF9800"
-        self.danger_color = "#F44336"
+def get_meipass_tools_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.join(sys._MEIPASS, "tools")
+    return get_tools_dir()
 
-        self.root.configure(bg=self.bg_color)
 
-    def create_widgets(self):
-        """创建界面组件"""
-        # 标题
-        title_label = tk.Label(
-            self.root,
-            text="M3U8视频下载器",
-            font=("微软雅黑", 24, "bold"),
-            bg=self.primary_color,
-            fg="white",
-            pady=10
-        )
-        title_label.pack(fill=tk.X)
+def format_size(size_bytes: float) -> str:
+    if size_bytes <= 0:
+        return "0 B"
+    units = ("B", "KB", "MB", "GB", "TB")
+    i = int(math.floor(math.log(max(size_bytes, 1), 1024)))
+    i = min(i, len(units) - 1)
+    return f"{size_bytes / math.pow(1024, i):.2f} {units[i]}"
 
-        # 主容器
-        main_frame = tk.Frame(self.root, bg=self.bg_color, padx=20, pady=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 创建左侧输入区域和右侧进度区域
-        left_frame = tk.Frame(main_frame, bg=self.bg_color)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+def format_speed(bps: float) -> str:
+    return format_size(bps) + "/s"
 
-        right_frame = tk.Frame(main_frame, bg=self.bg_color)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        # 左侧：输入设置区域
-        settings_frame = tk.LabelFrame(
-            left_frame,
-            text="下载设置",
-            font=("微软雅黑", 12, "bold"),
-            bg=self.bg_color,
-            padx=15,
-            pady=15
-        )
-        settings_frame.pack(fill=tk.BOTH, expand=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# DownloaderManager —— 自动查找 N_m3u8DL-CLI（保留原版逻辑）
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        # M3U8地址输入
-        m3u8_frame = tk.Frame(settings_frame, bg=self.bg_color)
-        m3u8_frame.pack(fill=tk.X, pady=(0, 15))
+class DownloaderManager:
+    """管理 N_m3u8DL-CLI 下载器路径，查找逻辑与原版一致"""
 
-        tk.Label(
-            m3u8_frame,
-            text="M3U8地址:",
-            font=("微软雅黑", 11),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 10), anchor=tk.W)
+    CANDIDATE_NAMES = [
+        "N_m3u8DL-CLI_v3.0.2.exe",  # 带版本号的完整名称
+        "N_m3u8DL-CLI.exe",          # 通用名称
+        "N_m3u8DL-CLI-SimpleG.exe",  # SimpleG 版本
+    ]
 
-        self.m3u8_url = tk.Entry(
-            m3u8_frame,
-            font=("微软雅黑", 11),
-            width=40
-        )
-        self.m3u8_url.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    def __init__(self):
+        self._custom_path: str = ""
 
-        # 工作目录设置
-        workdir_frame = tk.Frame(settings_frame, bg=self.bg_color)
-        workdir_frame.pack(fill=tk.X, pady=(0, 15))
+    def set_custom_path(self, path: str):
+        self._custom_path = path.strip()
 
-        tk.Label(
-            workdir_frame,
-            text="输出目录:",
-            font=("微软雅黑", 11),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 10), anchor=tk.W)
+    def get_custom_path(self) -> str:
+        return self._custom_path
 
-        self.work_dir = tk.Entry(
-            workdir_frame,
-            font=("微软雅黑", 11),
-            width=40
-        )
-        self.work_dir.insert(0, os.path.join(os.path.expanduser("~"), "Downloads", "M3U8_Downloads"))
-        self.work_dir.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    def get_downloader_path(self) -> str:
+        """获取下载器路径，优先级：手动指定 > PyInstaller tools > 开发环境 tools"""
+        # 0. 用户手动指定
+        if self._custom_path and os.path.isfile(self._custom_path):
+            return self._custom_path
 
-        browse_dir_btn = tk.Button(
-            workdir_frame,
-            text="浏览",
-            font=("微软雅黑", 9),
-            bg=self.secondary_color,
-            fg="white",
-            command=self.browse_directory,
-            padx=10,
-            pady=3,
-            cursor="hand2"
-        )
-        browse_dir_btn.pack(side=tk.LEFT, padx=(5, 0))
-
-        # 保存文件名设置
-        filename_frame = tk.Frame(settings_frame, bg=self.bg_color)
-        filename_frame.pack(fill=tk.X, pady=(0, 15))
-
-        tk.Label(
-            filename_frame,
-            text="文件名:",
-            font=("微软雅黑", 11),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 10), anchor=tk.W)
-
-        self.save_name = tk.Entry(
-            filename_frame,
-            font=("微软雅黑", 11),
-            width=40
-        )
-        self.save_name.insert(0, "output")
-        self.save_name.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # 线程设置
-        thread_frame = tk.Frame(settings_frame, bg=self.bg_color)
-        thread_frame.pack(fill=tk.X, pady=(0, 15))
-
-        tk.Label(
-            thread_frame,
-            text="线程设置:",
-            font=("微软雅黑", 11),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 10), anchor=tk.W)
-
-        # 最高线程数
-        tk.Label(
-            thread_frame,
-            text="最高线程:",
-            font=("微软雅黑", 10),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 5))
-
-        self.max_threads = ttk.Spinbox(
-            thread_frame,
-            from_=1,
-            to=32,
-            width=8,
-            font=("微软雅黑", 10)
-        )
-        self.max_threads.set("16")
-        self.max_threads.pack(side=tk.LEFT, padx=(0, 15))
-
-        # 最低线程数
-        tk.Label(
-            thread_frame,
-            text="最低线程:",
-            font=("微软雅黑", 10),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 5))
-
-        self.min_threads = ttk.Spinbox(
-            thread_frame,
-            from_=1,
-            to=32,
-            width=8,
-            font=("微软雅黑", 10)
-        )
-        self.min_threads.set("8")
-        self.min_threads.pack(side=tk.LEFT)
-
-        # 控制按钮区域
-        button_frame = tk.Frame(settings_frame, bg=self.bg_color)
-        button_frame.pack(fill=tk.X, pady=(20, 0))
-
-        self.start_button = tk.Button(
-            button_frame,
-            text="开始下载",
-            font=("微软雅黑", 12, "bold"),
-            bg=self.success_color,
-            fg="white",
-            command=self.start_download,
-            padx=30,
-            pady=10,
-            cursor="hand2"
-        )
-        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.stop_button = tk.Button(
-            button_frame,
-            text="停止下载",
-            font=("微软雅黑", 12, "bold"),
-            bg=self.danger_color,
-            fg="white",
-            command=self.stop_download,
-            padx=30,
-            pady=10,
-            cursor="hand2",
-            state=tk.DISABLED
-        )
-        self.stop_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.clear_button = tk.Button(
-            button_frame,
-            text="清空日志",
-            font=("微软雅黑", 11),
-            bg=self.primary_color,
-            fg="white",
-            command=self.clear_logs,
-            padx=20,
-            pady=8,
-            cursor="hand2"
-        )
-        self.clear_button.pack(side=tk.LEFT)
-
-        # 右侧：进度显示区域
-        progress_frame = tk.LabelFrame(
-            right_frame,
-            text="下载进度",
-            font=("微软雅黑", 12, "bold"),
-            bg=self.bg_color,
-            padx=15,
-            pady=15
-        )
-        progress_frame.pack(fill=tk.BOTH, expand=True)
-
-        # 总进度条
-        self.total_progress_label = tk.Label(
-            progress_frame,
-            text="准备下载...",
-            font=("微软雅黑", 10),
-            bg=self.bg_color
-        )
-        self.total_progress_label.pack(anchor=tk.W)
-
-        self.total_progress = ttk.Progressbar(
-            progress_frame,
-            length=400,
-            mode='determinate'
-        )
-        self.total_progress.pack(fill=tk.X, pady=(5, 15))
-
-        # 下载进度
-        download_frame = tk.Frame(progress_frame, bg=self.bg_color)
-        download_frame.pack(fill=tk.X, pady=(0, 10))
-
-        tk.Label(
-            download_frame,
-            text="下载进度:",
-            font=("微软雅黑", 10, "bold"),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 10))
-
-        self.download_progress_label = tk.Label(
-            download_frame,
-            text="0/0 (0.00%)",
-            font=("微软雅黑", 10),
-            bg=self.bg_color,
-            fg=self.primary_color
-        )
-        self.download_progress_label.pack(side=tk.LEFT)
-
-        # 合并进度
-        merge_frame = tk.Frame(progress_frame, bg=self.bg_color)
-        merge_frame.pack(fill=tk.X, pady=(0, 10))
-
-        tk.Label(
-            merge_frame,
-            text="合并进度:",
-            font=("微软雅黑", 10, "bold"),
-            bg=self.bg_color
-        ).pack(side=tk.LEFT, padx=(0, 10))
-
-        self.merge_progress_label = tk.Label(
-            merge_frame,
-            text="等待合并...",
-            font=("微软雅黑", 10),
-            bg=self.bg_color,
-            fg=self.warning_color
-        )
-        self.merge_progress_label.pack(side=tk.LEFT)
-
-        # 速度显示
-        self.speed_label = tk.Label(
-            progress_frame,
-            text="速度: 0 KB/s",
-            font=("微软雅黑", 10),
-            bg=self.bg_color,
-            fg=self.success_color
-        )
-        self.speed_label.pack(anchor=tk.W)
-
-        # 文件信息显示
-        self.file_info_label = tk.Label(
-            progress_frame,
-            text="文件信息: 等待获取...",
-            font=("微软雅黑", 9),
-            bg=self.bg_color,
-            fg="gray",
-            wraplength=400,
-            justify=tk.LEFT
-        )
-        self.file_info_label.pack(anchor=tk.W, pady=(10, 0))
-
-        # 工具状态显示
-        self.tool_status_label = tk.Label(
-            progress_frame,
-            text="工具状态: 正在检查...",
-            font=("微软雅黑", 9),
-            bg=self.bg_color,
-            fg="blue",
-            wraplength=400,
-            justify=tk.LEFT
-        )
-        self.tool_status_label.pack(anchor=tk.W, pady=(5, 0))
-
-        # 日志输出区域
-        log_frame = tk.LabelFrame(
-            right_frame,
-            text="实时日志",
-            font=("微软雅黑", 12, "bold"),
-            bg=self.bg_color,
-            padx=15,
-            pady=15
-        )
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=12,
-            font=("Consolas", 9),
-            wrap=tk.WORD,
-            bg="#1e1e1e",
-            fg="white",
-            insertbackground="white"
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-
-        # 状态栏
-        self.status_bar = tk.Label(
-            self.root,
-            text="就绪 | 输出目录: 请设置 | 文件名: output",
-            bd=1,
-            relief=tk.SUNKEN,
-            anchor=tk.W,
-            font=("微软雅黑", 9),
-            bg="#e0e0e0"
-        )
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-        # 启动后检查工具状态
-        self.root.after(100, self.check_tool_status)
-
-        # 添加时间戳和欢迎信息
-        self.log_message("=" * 60)
-        self.log_message("M3U8视频下载器 已启动")
-        self.log_message(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.log_message("=" * 60)
-        self.update_status("就绪")
-
-    def check_tool_status(self):
-        """检查工具状态并更新UI"""
-        tool_path = self.downloader_manager.get_downloader_path()
-        if tool_path:
-            self.tool_status_label.config(text=f"工具状态: 就绪", fg=self.success_color)
+        # 1. PyInstaller 打包环境（与原版逻辑完全对应）
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
+            # 先检查 tools 子目录
+            tools_dir = os.path.join(base_path, 'tools')
+            if os.path.exists(tools_dir):
+                for exe_name in self.CANDIDATE_NAMES:
+                    exe_path = os.path.join(tools_dir, exe_name)
+                    if os.path.exists(exe_path):
+                        return exe_path
+            # 再检查根目录
+            for exe_name in self.CANDIDATE_NAMES:
+                exe_path = os.path.join(base_path, exe_name)
+                if os.path.exists(exe_path):
+                    return exe_path
         else:
-            self.tool_status_label.config(text="工具状态: 未找到必要组件", fg=self.danger_color)
+            # 2. 开发环境：当前目录下的 tools 文件夹
+            dev_tools_dir = os.path.join(os.getcwd(), "tools")
+            if os.path.exists(dev_tools_dir):
+                for exe_name in self.CANDIDATE_NAMES:
+                    exe_path = os.path.join(dev_tools_dir, exe_name)
+                    if os.path.exists(exe_path):
+                        return exe_path
 
-    def browse_directory(self):
-        """浏览并选择输出目录"""
-        directory = filedialog.askdirectory(title="选择输出目录")
-        if directory:
-            self.work_dir.delete(0, tk.END)
-            self.work_dir.insert(0, directory)
-            self.update_status(f"输出目录: {directory}")
+        return ""
 
-    def log_message(self, message):
-        """向日志框添加消息"""
-        timestamp = datetime.now().strftime("[%H:%M:%S] ")
-        self.log_text.insert(tk.END, timestamp + message + "\n")
-        self.log_text.see(tk.END)
-        self.root.update()
 
-    def update_status(self, message):
-        """更新状态栏"""
-        work_dir = self.work_dir.get().strip()
-        save_name = self.save_name.get().strip()
-        status_text = f"{message} | 输出目录: {work_dir if work_dir else '未设置'} | 文件名: {save_name if save_name else '未设置'}"
-        self.status_bar.config(text=status_text)
-        self.root.update()
+# ═══════════════════════════════════════════════════════════════════════════════
+# FFmpegManager —— 查找 ffmpeg.exe
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    def start_download(self):
-        """开始下载"""
-        if self.downloading:
-            messagebox.showwarning("警告", "下载正在进行中！")
-            return
-            
-        # 验证输入
-        m3u8_url = self.m3u8_url.get().strip()
-        if not m3u8_url:
-            messagebox.showerror("错误", "请输入M3U8地址！")
-            return
-            
-        # 验证URL格式
-        if not (m3u8_url.startswith("http://") or m3u8_url.startswith("https://")):
-            messagebox.showerror("错误", "请输入有效的HTTP/HTTPS地址！")
-            return
-        
-        # 验证输出目录
-        work_dir = self.work_dir.get().strip()
-        if not work_dir:
-            messagebox.showerror("错误", "请输入输出目录！")
-            return
-            
-        # 验证文件名
-        save_name = self.save_name.get().strip()
-        if not save_name:
-            messagebox.showerror("错误", "请输入保存文件名！")
-            return
-            
-        # 检查文件名是否包含非法字符
-        illegal_chars = ['<', '>', ':', '"', '|', '?', '*', '\\', '/']
-        for char in illegal_chars:
-            if char in save_name:
-                messagebox.showerror("错误", f"文件名包含非法字符: {char}")
-                return
-            
-        try:
-            max_threads = int(self.max_threads.get())
-            min_threads = int(self.min_threads.get())
-            
-            if min_threads > max_threads:
-                messagebox.showerror("错误", "最低线程数不能大于最高线程数！")
-                return
-                
-            if max_threads < 1 or min_threads < 1:
-                messagebox.showerror("错误", "线程数必须大于0！")
-                return
-                
-        except ValueError:
-            messagebox.showerror("错误", "请输入有效的线程数！")
-            return
+class FFmpegManager:
+    def __init__(self):
+        self._custom_path: str = ""
 
-        # 获取下载器路径
-        downloader_path = self.downloader_manager.get_downloader_path()
-        if not downloader_path:
-            messagebox.showerror("错误", "无法找到下载器，请确保程序已正确打包。")
-            return
+    def set_custom_path(self, path: str):
+        self._custom_path = path.strip()
 
-        # 更新UI状态
-        self.downloading = True
-        self.start_button.config(state=tk.DISABLED, bg="#cccccc")
-        self.stop_button.config(state=tk.NORMAL)
+    def get_custom_path(self) -> str:
+        return self._custom_path
 
-        # 重置进度条
-        self.total_progress['value'] = 0
-        self.download_progress_label.config(text="0/0 (0.00%)")
-        self.merge_progress_label.config(text="等待合并...", fg=self.warning_color)
-        self.speed_label.config(text="速度: 0 KB/s")
-        self.file_info_label.config(text="文件信息: 等待获取...")
-        self.total_progress_label.config(text="正在初始化下载...")
-        self.update_status("正在启动下载...")
+    def get_ffmpeg_path(self) -> str:
+        if self._custom_path and os.path.isfile(self._custom_path):
+            return self._custom_path
+        # PyInstaller 环境
+        if getattr(sys, 'frozen', False):
+            for candidate in [
+                os.path.join(get_meipass_tools_dir(), "ffmpeg.exe"),
+                os.path.join(sys._MEIPASS, "ffmpeg.exe"),
+            ]:
+                if os.path.isfile(candidate):
+                    return candidate
+        # tools 目录
+        p = os.path.join(get_tools_dir(), "ffmpeg.exe")
+        if os.path.isfile(p):
+            return p
+        # 同级目录
+        p = os.path.join(get_base_dir(), "ffmpeg.exe")
+        if os.path.isfile(p):
+            return p
+        return ""
 
-        # 在新线程中开始下载
-        download_thread = threading.Thread(
-            target=self.download_m3u8,
-            args=(m3u8_url, work_dir, save_name, max_threads, min_threads, downloader_path),
-            daemon=True
-        )
-        download_thread.start()
+    def is_available(self) -> bool:
+        return bool(self.get_ffmpeg_path())
 
-    def stop_download(self):
-        """停止下载"""
-        if self.downloading and self.process:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DownloadWorker —— 后台下载线程
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DownloadWorker(QObject):
+    """
+    后台线程下载工作器。
+    M3U8 下载策略与原版完全一致：
+      Step1 requests 下载 .m3u8 到临时文件
+      Step2 N_m3u8DL-CLI 读取临时文件执行下载
+      完成后清理临时文件
+    """
+    log_signal      = pyqtSignal(str, str)   # (message, level)
+    progress_signal = pyqtSignal(float)       # 0~100
+    status_signal   = pyqtSignal(str)
+    speed_signal    = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)   # (success, output_path)
+
+    def __init__(
+        self,
+        url: str,
+        work_dir: str,
+        save_name: str,
+        max_threads: int,
+        min_threads: int,
+        downloader_path: str,
+        ffmpeg_path: str,
+        output_format: str,
+        is_local_m3u8: bool = False,
+    ):
+        super().__init__()
+        self.url             = url
+        self.work_dir        = work_dir
+        self.save_name       = save_name
+        self.max_threads     = max_threads
+        self.min_threads     = min_threads
+        self.downloader_path = downloader_path
+        self.ffmpeg_path     = ffmpeg_path
+        self.output_format   = output_format.lower().strip(".")
+        self.is_local_m3u8   = is_local_m3u8
+        self._stop_event     = threading.Event()
+        self._process: subprocess.Popen = None
+
+    def stop(self):
+        self._stop_event.set()
+        if self._process and self._process.poll() is None:
             try:
-                self.process.terminate()
-                self.log_message("正在停止下载进程...")
-                self.update_status("正在停止下载...")
-            except:
+                self._process.terminate()
+            except Exception:
                 pass
-            finally:
-                self.downloading = False
-                self.log_message("下载已停止")
-                self.total_progress_label.config(text="下载已停止")
-                self.merge_progress_label.config(text="已停止", fg=self.danger_color)
-                self.update_status("下载已停止")
-                self.reset_ui_state()
-                
-    def reset_ui_state(self):
-        """重置UI状态"""
-        self.start_button.config(state=tk.NORMAL, bg=self.success_color)
-        self.stop_button.config(state=tk.DISABLED)
-        
-    def download_m3u8(self, m3u8_url, work_dir, save_name, max_threads, min_threads, downloader_path):
-        """执行下载操作"""
-        try:
-            # 临时M3U8文件路径
-            temp_m3u8 = os.path.join(work_dir, f"temp_playlist_{int(datetime.now().timestamp())}.m3u8")
 
-            # 步骤1: 使用requests库下载m3u8文件
-            self.log_message(f"步骤1: 下载M3U8文件")
-            self.log_message(f"URL: {m3u8_url}")
-            self.update_status("正在下载M3U8文件...")
+    def run(self):
+        try:
+            self._execute()
+        except Exception as e:
+            self.log_signal.emit(f"发生未预期错误: {e}", "error")
+            self.finished_signal.emit(False, "")
+
+    # ── 主调度 ──────────────────────────────────────────────────────────────────
+
+    def _execute(self):
+        os.makedirs(self.work_dir, exist_ok=True)
+
+        parsed    = urlparse(self.url)
+        is_http   = parsed.scheme in ("http", "https")
+        # 只取 path 部分做后缀判断，忽略 ?query 参数（如 play.m3u8?_KS=xxx）
+        path_lower = parsed.path.lower()
+        is_m3u8 = self.is_local_m3u8 or path_lower.endswith(".m3u8")
+
+        if is_m3u8:
+            # ── M3U8 下载（使用与原版完全相同的策略）
+            self._download_m3u8(self.url)
+        elif is_http:
+            # ── 普通视频 URL，直接下载
+            self._download_direct(self.url)
+        else:
+            # ── 本地文件，直接走格式转换
+            self.log_signal.emit("输入为本地文件，跳过下载", "info")
+            self._maybe_convert(self.url)
+
+    # ── M3U8 下载（完整保留原版策略） ──────────────────────────────────────────
+
+    def _download_m3u8(self, m3u8_url: str):
+        """
+        与原版 download_m3u8() 逻辑完全一致：
+          Step1: requests 下载 m3u8 到本地临时文件
+          Step2: N_m3u8DL-CLI 消费临时文件
+          完成后清理临时文件，检查退出码
+        """
+        if not self.downloader_path:
+            self.log_signal.emit("错误: 无法找到下载器，请确保程序已正确打包。", "error")
+            self.finished_signal.emit(False, "")
+            return
+
+        # 临时 M3U8 文件路径
+        temp_m3u8 = os.path.join(
+            self.work_dir,
+            f"temp_playlist_{int(datetime.now().timestamp())}.m3u8"
+        )
+
+        # ──────────────────────────────────────────────────────
+        # Step1: 用 requests 下载 m3u8 文件（本地文件跳过此步）
+        # ──────────────────────────────────────────────────────
+        if self.is_local_m3u8 or not (m3u8_url.startswith("http://") or m3u8_url.startswith("https://")):
+            # 本地文件直接使用，无需下载
+            temp_m3u8 = m3u8_url
+            is_temp = False
+            self.log_signal.emit(f"使用本地 M3U8 文件: {m3u8_url}", "info")
+        else:
+            is_temp = True
+            self.log_signal.emit("步骤1: 下载M3U8文件", "info")
+            self.log_signal.emit(f"URL: {m3u8_url}", "info")
+            self.status_signal.emit("正在下载M3U8文件...")
+
+            if not HAS_REQUESTS:
+                self.log_signal.emit("错误: requests 库未安装！", "error")
+                self.finished_signal.emit(False, "")
+                return
 
             try:
-                self.log_message("正在下载M3U8文件...")
+                self.log_signal.emit("正在下载M3U8文件...", "info")
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/91.0.4472.124 Safari/537.36'
+                    )
                 }
                 response = requests.get(m3u8_url, headers=headers, timeout=30)
                 response.raise_for_status()
@@ -548,291 +309,1222 @@ class M3U8DownloaderGUI:
                 with open(temp_m3u8, 'wb') as f:
                     f.write(response.content)
 
-                self.log_message("M3U8文件下载完成")
-                self.update_status("M3U8文件下载完成")
+                self.log_signal.emit("M3U8文件下载完成", "success")
+                self.status_signal.emit("M3U8文件下载完成")
 
             except requests.exceptions.RequestException as e:
-                error_msg = f"M3U8文件下载失败: {e}"
-                self.log_message(error_msg)
-                self.update_status("M3U8下载失败")
-                self.on_download_failed()
+                self.log_signal.emit(f"M3U8文件下载失败: {e}", "error")
+                self.status_signal.emit("M3U8下载失败")
+                self.finished_signal.emit(False, "")
                 return
 
-            # 步骤2: 使用N_m3u8DL-CLI下载视频
-            self.log_message(f"步骤2: 下载视频")
-            self.log_message(f"输出目录: {work_dir}")
-            self.log_message(f"文件名: {save_name}")
-            self.update_status("正在启动视频下载...")
+        # ──────────────────────────────────────────────────────
+        # Step2: 用 N_m3u8DL-CLI 下载视频
+        # ──────────────────────────────────────────────────────
+        self.log_signal.emit("步骤2: 下载视频", "info")
+        self.log_signal.emit(f"输出目录: {self.work_dir}", "info")
+        self.log_signal.emit(f"文件名: {self.save_name}", "info")
+        self.status_signal.emit("正在启动视频下载...")
 
-            # 创建工作目录（如果不存在）
-            if not os.path.exists(work_dir):
-                try:
-                    os.makedirs(work_dir)
-                    self.log_message(f"创建工作目录: {work_dir}")
-                except Exception as e:
-                    self.log_message(f"创建工作目录失败: {str(e)}")
+        # 获取下载器目录（确保 ffmpeg 在同一目录下能被找到）
+        downloader_dir = os.path.dirname(self.downloader_path)
 
-            # 获取下载器目录，确保ffmpeg在同一目录下能被找到
-            downloader_dir = os.path.dirname(downloader_path)
+        cmd = [
+            self.downloader_path,
+            temp_m3u8,
+            "--workDir",     self.work_dir,
+            "--saveName",    self.save_name,
+            "--maxThreads",  str(self.max_threads),
+            "--minThreads",  str(self.min_threads),
+            "--retryCount",  "99",
+            "--enableDelAfterDone",
+        ]
 
-            # 构建命令
-            cmd = [
-                downloader_path,
-                temp_m3u8,
-                "--workDir", work_dir,
-                "--saveName", save_name,
-                "--maxThreads", str(max_threads),
-                "--minThreads", str(min_threads),
-                "--retryCount", "99",
-                "--enableDelAfterDone"
-            ]
+        self.log_signal.emit("正在执行下载命令...", "info")
+        self.status_signal.emit("正在执行下载命令...")
 
-            self.log_message("正在执行下载命令...")
-            self.update_status("正在执行下载命令...")
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                creationflags=creation_flags,
+                shell=False,
+                cwd=downloader_dir,
+            )
+            self.log_signal.emit("下载进程已启动", "info")
+            self.status_signal.emit("下载进行中...")
+        except Exception as e:
+            self.log_signal.emit(f"启动下载进程失败: {e}", "error")
+            self.status_signal.emit("启动进程失败")
+            self.finished_signal.emit(False, "")
+            return
 
-            # 执行下载命令
-            try:
-                if sys.platform == 'win32':
-                    creation_flags = subprocess.CREATE_NO_WINDOW
-                else:
-                    creation_flags = 0
+        # 实时读取输出
+        for line in iter(self._process.stdout.readline, ''):
+            if self._stop_event.is_set():
+                self._process.terminate()
+                self.log_signal.emit("下载已被用户停止", "error")
+                break
+            line = line.strip()
+            if line:
+                self.log_signal.emit(line, self._classify_line(line))
+                self._parse_m3u8dl_progress(line)
 
-                # 设置工作目录到下载器所在目录，确保ffmpeg能被找到
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True,
-                    creationflags=creation_flags,
-                    shell=False,
-                    cwd=downloader_dir
-                )
+        self._process.wait()
 
-                self.log_message("下载进程已启动")
-                self.update_status("下载进行中...")
-
-            except Exception as e:
-                error_msg = f"启动下载进程失败: {str(e)}"
-                self.log_message(error_msg)
-                self.update_status("启动进程失败")
-                self.on_download_failed()
-                return
-
-            # 实时读取输出
-            for line in iter(self.process.stdout.readline, ''):
-                if not line:
-                    break
-
-                # 显示在日志中
-                line = line.strip()
-                if line:
-                    self.log_message(line)
-                    # 解析进度信息
-                    self.parse_progress(line)
-
-            # 等待进程完成
-            self.process.wait()
-
-            # 清理临时文件
+        # 清理临时文件
+        if is_temp:
             try:
                 if os.path.exists(temp_m3u8):
                     os.remove(temp_m3u8)
-                    self.log_message(f"已清理临时文件")
-            except:
+                    self.log_signal.emit("已清理临时文件", "info")
+            except Exception:
                 pass
 
-            # 检查退出码
-            if self.process.returncode == 0:
-                self.log_message("=" * 60)
-                self.log_message("下载完成！")
-                self.log_message(f"文件已保存到: {work_dir}")
-                self.log_message(f"文件名: {save_name}")
-                self.update_status("下载完成")
-                self.on_download_complete()
-            else:
-                error_msg = f"下载失败，退出码: {self.process.returncode}"
-                self.log_message(error_msg)
-                self.update_status("下载失败")
-                self.on_download_failed()
+        if self._stop_event.is_set():
+            self.finished_signal.emit(False, "")
+            return
 
-        except Exception as e:
-            error_msg = f"发生错误: {str(e)}"
-            self.log_message(error_msg)
-            self.update_status("发生错误")
-            self.on_download_failed()
-            
-    def parse_progress(self, line):
-        """解析进度信息并更新UI"""
-        try:
-            # 更新总进度标签
-            if "开始解析" in line or "开始下载" in line:
-                self.total_progress_label.config(text=line)
-                self.update_status(line)
-            elif "文件时长" in line:
-                self.total_progress_label.config(text=line)
-                self.file_info_label.config(text=f"文件信息: {line}")
-            elif "总分片" in line:
-                self.total_progress_label.config(text=line)
-                
-            # 解析下载进度
-            if "完成数量" in line and "/" in line:
-                # 例如: "完成数量 58 / 127"
-                match = re.search(r'完成数量\s+(\d+)\s+/\s+(\d+)', line)
-                if match:
-                    current = int(match.group(1))
-                    total = int(match.group(2))
-                    if total > 0:
-                        percentage = (current / total) * 100
-                        self.download_progress_label.config(
-                            text=f"{current}/{total} ({percentage:.2f}%)"
-                        )
-                        self.total_progress['value'] = percentage
-                        self.update_status(f"下载中: {current}/{total} ({percentage:.1f}%)")
-                        
-            # 解析合并进度
-            if "等待下载完成" in line:
-                self.merge_progress_label.config(text="等待下载完成...", fg=self.warning_color)
-            elif "开始合并" in line or "正在合并" in line:
-                self.merge_progress_label.config(text="正在合并文件...", fg=self.primary_color)
-                self.update_status("正在合并文件...")
-            elif "合并完成" in line or "完成合并" in line:
-                self.merge_progress_label.config(text="合并完成 ✓", fg=self.success_color)
-                self.total_progress['value'] = 100
-                self.update_status("合并完成")
-                
-            # 解析下载速度
-            if "KB/s" in line:
-                speed_match = re.search(r'(\d+\.?\d*)\s+KB/s', line)
-                if speed_match:
-                    speed = speed_match.group(1)
-                    self.speed_label.config(text=f"速度: {speed} KB/s")
-                    
-            # 解析文件信息
-            if "Video" in line or "Audio" in line:
-                self.file_info_label.config(text=f"文件信息: {line}")
-                    
-            # 解析总进度条
-            if "Progress:" in line:
-                # 例如: "Progress: 118/127 (92.91%) -- 27.61 MB/29.72 MB"
-                match = re.search(r'Progress:\s+(\d+)/(\d+)\s+\((\d+\.?\d*)%\)', line)
-                if match:
-                    current = int(match.group(1))
-                    total = int(match.group(2))
-                    percentage = float(match.group(3))
-                    self.download_progress_label.config(
-                        text=f"{current}/{total} ({percentage:.2f}%)"
-                    )
-                    self.total_progress['value'] = percentage
-                    self.update_status(f"进度: {percentage:.1f}%")
-                    
-        except Exception as e:
-            # 解析出错时不中断程序
-            pass
-            
-    def on_download_complete(self):
-        """下载完成时的处理"""
-        self.downloading = False
-        self.reset_ui_state()
-        work_dir = self.work_dir.get().strip()
-        save_name = self.save_name.get().strip()
-        self.total_progress_label.config(text=f"下载完成！文件: {save_name}", fg=self.success_color)
-        self.merge_progress_label.config(text="合并完成！ ✓", fg=self.success_color)
-        self.update_status(f"下载完成: {save_name}")
-        
-    def on_download_failed(self):
-        """下载失败时的处理"""
-        self.downloading = False
-        self.reset_ui_state()
-        self.total_progress_label.config(text="下载失败 ✗", fg=self.danger_color)
-        self.merge_progress_label.config(text="失败 ✗", fg=self.danger_color)
-        self.update_status("下载失败")
-        
-    def clear_logs(self):
-        """清空日志"""
-        self.log_text.delete(1.0, tk.END)
-        self.log_message("日志已清空")
-        self.update_status("日志已清空")
-        
-    def on_closing(self):
-        """关闭窗口时的处理"""
-        if self.downloading and self.process:
-            try:
-                self.process.terminate()
-                self.log_message("程序关闭，已终止下载进程")
-            except:
-                pass
-        self.root.destroy()
-
-
-class DownloaderManager:
-    """管理 N_m3u8DL-CLI 下载器的自动查找"""
-    
-    def __init__(self, gui_callback=None):
-        self.gui_log = gui_callback if gui_callback else print
-        
-    def get_downloader_path(self):
-        """获取下载器路径"""
-        # 定义所有可能的文件名（按优先级排序）
-        possible_names = [
-            "N_m3u8DL-CLI_v3.0.2.exe",  # 带版本号的完整名称
-            "N_m3u8DL-CLI.exe",         # 通用名称
-            "N_m3u8DL-CLI-SimpleG.exe", # SimpleG版本
-        ]
-        
-        # 1. 优先检查 PyInstaller 打包环境
-        if getattr(sys, 'frozen', False):
-            base_path = sys._MEIPASS
-            
-            # 首先检查 tools 子目录（根据您的日志，文件在这里）
-            tools_dir = os.path.join(base_path, 'tools')
-            if os.path.exists(tools_dir):
-                for exe_name in possible_names:
-                    exe_path = os.path.join(tools_dir, exe_name)
-                    if os.path.exists(exe_path):
-                        #self.gui_log(f"找到下载器: {exe_name}")
-                        return exe_path
-            
-            # 如果没找到，尝试根目录
-            for exe_name in possible_names:
-                exe_path = os.path.join(base_path, exe_name)
-                if os.path.exists(exe_path):
-                    #self.gui_log(f"找到下载器: {exe_name}")
-                    return exe_path
-        
+        # 检查退出码
+        if self._process.returncode == 0:
+            self.log_signal.emit("=" * 60, "info")
+            self.log_signal.emit("下载完成！", "success")
+            self.log_signal.emit(f"文件已保存到: {self.work_dir}", "success")
+            self.log_signal.emit(f"文件名: {self.save_name}", "success")
+            self.status_signal.emit("下载完成")
+            # 检查是否需要格式转换
+            raw_out = os.path.join(self.work_dir, f"{self.save_name}.mp4")
+            self._maybe_convert(raw_out)
         else:
-            # 2. 开发环境：当前目录下的 tools 文件夹
-            dev_tools_dir = os.path.join(os.getcwd(), "tools")
-            if os.path.exists(dev_tools_dir):
-                for exe_name in possible_names:
-                    exe_path = os.path.join(dev_tools_dir, exe_name)
-                    if os.path.exists(exe_path):
-                        #self.gui_log(f"找到下载器: {exe_name}")
-                        return exe_path
-        
-        # 3. 如果以上都未找到
-        self.gui_log("错误: 未找到N_m3u8DL-CLI可执行文件")
-        return None
+            self.log_signal.emit(f"下载失败，退出码: {self._process.returncode}", "error")
+            self.status_signal.emit("下载失败")
+            self.finished_signal.emit(False, "")
 
+    # ── 普通视频直接下载（requests 流式 + 断点续传） ──────────────────────────
+
+    def _download_direct(self, url: str):
+        self.log_signal.emit("─" * 50, "info")
+        self.log_signal.emit("检测到普通视频 URL，启动直接下载", "info")
+
+        if not HAS_REQUESTS:
+            self.log_signal.emit("错误：requests 库未安装，无法直接下载！", "error")
+            self.finished_signal.emit(False, "")
+            return
+
+        path_part = urlparse(url).path
+        ext       = os.path.splitext(path_part)[1] or ".mp4"
+        save_file = os.path.join(self.work_dir, f"{self.save_name}{ext}")
+
+        self.log_signal.emit(f"目标文件：{save_file}", "info")
+        self.status_signal.emit("正在连接服务器...")
+
+        try:
+            head       = requests.head(url, timeout=15, allow_redirects=True)
+            total_size = int(head.headers.get("Content-Length", 0))
+            supports_range = "bytes" in head.headers.get("Accept-Ranges", "")
+        except Exception as e:
+            self.log_signal.emit(f"HEAD 请求失败：{e}，尝试直接下载", "info")
+            total_size     = 0
+            supports_range = False
+
+        downloaded = os.path.getsize(save_file) if os.path.exists(save_file) else 0
+        if downloaded >= total_size > 0:
+            self.log_signal.emit("文件已存在且完整，跳过下载", "success")
+            self.progress_signal.emit(100.0)
+            self._maybe_convert(save_file)
+            return
+
+        headers = {}
+        mode    = "ab"
+        if supports_range and downloaded > 0:
+            headers["Range"] = f"bytes={downloaded}-"
+            self.log_signal.emit(f"断点续传，已下载：{format_size(downloaded)}", "info")
+        elif downloaded > 0 and not supports_range:
+            downloaded = 0
+            mode       = "wb"
+
+        self.status_signal.emit("正在下载...")
+
+        try:
+            resp = requests.get(url, headers=headers, stream=True, timeout=30)
+            resp.raise_for_status()
+        except Exception as e:
+            self.log_signal.emit(f"下载请求失败：{e}", "error")
+            self.finished_signal.emit(False, "")
+            return
+
+        start_time       = time.time()
+        chunk_downloaded = 0
+
+        with open(save_file, mode) as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if self._stop_event.is_set():
+                    self.log_signal.emit("下载已被用户停止", "error")
+                    self.finished_signal.emit(False, "")
+                    return
+                if chunk:
+                    f.write(chunk)
+                    chunk_downloaded += len(chunk)
+                    elapsed = time.time() - start_time
+                    speed   = chunk_downloaded / elapsed if elapsed > 0 else 0
+                    self.speed_signal.emit(format_speed(speed))
+                    if total_size > 0:
+                        done = downloaded + chunk_downloaded
+                        pct  = min(done / total_size * 100, 100.0)
+                        self.progress_signal.emit(pct)
+
+        self.log_signal.emit(f"文件下载完成：{save_file}", "success")
+        self.progress_signal.emit(100.0)
+        self._maybe_convert(save_file)
+
+    # ── 格式转换（ffmpeg） ──────────────────────────────────────────────────────
+
+    def _maybe_convert(self, src_file: str):
+        """若输出格式与当前文件格式不同，调用 ffmpeg 转换"""
+        if not os.path.exists(src_file):
+            self.log_signal.emit(f"错误：输出文件不存在：{src_file}", "error")
+            self.finished_signal.emit(False, "")
+            return
+
+        src_ext = os.path.splitext(src_file)[1].lower().strip(".")
+        if src_ext == self.output_format or not self.output_format:
+            self.log_signal.emit("无需格式转换", "info")
+            self.finished_signal.emit(True, src_file)
+            return
+
+        if not self.ffmpeg_path:
+            self.log_signal.emit("警告：未找到 ffmpeg，跳过格式转换", "error")
+            self.finished_signal.emit(True, src_file)
+            return
+
+        dst_file = os.path.join(self.work_dir, f"{self.save_name}.{self.output_format}")
+        self.log_signal.emit(f"开始格式转换：{src_ext} -> {self.output_format}", "info")
+        self._run_ffmpeg(src_file, dst_file)
+
+    def _run_ffmpeg(self, src: str, dst: str, extra_args: list = None):
+        cmd = [self.ffmpeg_path, "-i", src]
+        if extra_args:
+            cmd += extra_args
+        cmd += ["-y", dst]
+
+        self.log_signal.emit(f"ffmpeg 命令：{' '.join(cmd)}", "info")
+        self.status_signal.emit("正在转换格式...")
+
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creation_flags,
+            )
+        except Exception as e:
+            self.log_signal.emit(f"启动 ffmpeg 失败：{e}", "error")
+            self.finished_signal.emit(False, "")
+            return
+
+        duration_sec = None
+        for line in iter(self._process.stdout.readline, ""):
+            if self._stop_event.is_set():
+                self._process.terminate()
+                self.log_signal.emit("ffmpeg 已被用户终止", "error")
+                self.finished_signal.emit(False, "")
+                return
+            line = line.rstrip()
+            if not line:
+                continue
+            self.log_signal.emit(line, "info")
+            dur_m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", line)
+            if dur_m and duration_sec is None:
+                h, m, s = int(dur_m.group(1)), int(dur_m.group(2)), float(dur_m.group(3))
+                duration_sec = h * 3600 + m * 60 + s
+            time_m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
+            if time_m and duration_sec and duration_sec > 0:
+                h, m, s = int(time_m.group(1)), int(time_m.group(2)), float(time_m.group(3))
+                current_sec = h * 3600 + m * 60 + s
+                self.progress_signal.emit(min(current_sec / duration_sec * 100, 100.0))
+
+        self._process.wait()
+        if self._process.returncode == 0:
+            self.log_signal.emit(f"格式转换完成：{dst}", "success")
+            self.progress_signal.emit(100.0)
+            self.finished_signal.emit(True, dst)
+        else:
+            self.log_signal.emit(f"ffmpeg 转换失败，退出码：{self._process.returncode}", "error")
+            self.finished_signal.emit(False, "")
+
+    # ── 工具方法 ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _classify_line(line: str) -> str:
+        l = line.lower()
+        if any(k in l for k in ("error", "错误", "failed", "fail")):
+            return "error"
+        if any(k in l for k in ("完成", "success", "done", "finish")):
+            return "success"
+        if any(k in l for k in ("progress", "%", "kb/s", "mb/s", "完成数量")):
+            return "progress"
+        return "info"
+
+    def _parse_m3u8dl_progress(self, line: str):
+        # Progress: 118/127 (92.91%)
+        m = re.search(r'Progress:\s*(\d+)/(\d+)\s*\((\d+\.?\d*)%\)', line)
+        if m:
+            self.progress_signal.emit(float(m.group(3)))
+            return
+        # 完成数量 58 / 127
+        m2 = re.search(r'完成数量\s+(\d+)\s*/\s*(\d+)', line)
+        if m2:
+            cur, tot = int(m2.group(1)), int(m2.group(2))
+            if tot > 0:
+                self.progress_signal.emit(cur / tot * 100)
+        # 速度
+        m3 = re.search(r'(\d+\.?\d*)\s*(KB|MB)/s', line)
+        if m3:
+            self.speed_signal.emit(f"{m3.group(1)} {m3.group(2)}/s")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ConvertWorker —— 纯 ffmpeg 格式转换后台线程
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ConvertWorker(QObject):
+    log_signal      = pyqtSignal(str, str)
+    progress_signal = pyqtSignal(float)
+    status_signal   = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, ffmpeg_path: str, src: str, dst: str, extra_args: str = ""):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path
+        self.src         = src
+        self.dst         = dst
+        self.extra_args  = extra_args
+        self._stop_event = threading.Event()
+        self._process: subprocess.Popen = None
+
+    def stop(self):
+        self._stop_event.set()
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self._execute()
+        except Exception as e:
+            self.log_signal.emit(f"转换错误：{e}", "error")
+            self.finished_signal.emit(False, "")
+
+    def _execute(self):
+        if not self.ffmpeg_path:
+            self.log_signal.emit("错误：未找到 ffmpeg.exe！", "error")
+            self.finished_signal.emit(False, "")
+            return
+
+        cmd = [self.ffmpeg_path, "-i", self.src]
+        if self.extra_args.strip():
+            import shlex
+            cmd += shlex.split(self.extra_args)
+        cmd += ["-y", self.dst]
+
+        self.log_signal.emit(f"ffmpeg 命令：{' '.join(cmd)}", "info")
+        self.status_signal.emit("正在转换...")
+
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creation_flags,
+            )
+        except Exception as e:
+            self.log_signal.emit(f"启动 ffmpeg 失败：{e}", "error")
+            self.finished_signal.emit(False, "")
+            return
+
+        duration_sec = None
+        for line in iter(self._process.stdout.readline, ""):
+            if self._stop_event.is_set():
+                self._process.terminate()
+                self.log_signal.emit("转换已被用户停止", "error")
+                self.finished_signal.emit(False, "")
+                return
+            line = line.rstrip()
+            if not line:
+                continue
+            self.log_signal.emit(line, "info")
+            dur_m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", line)
+            if dur_m and duration_sec is None:
+                h, m, s = int(dur_m.group(1)), int(dur_m.group(2)), float(dur_m.group(3))
+                duration_sec = h * 3600 + m * 60 + s
+            time_m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
+            if time_m and duration_sec and duration_sec > 0:
+                h, m, s = int(time_m.group(1)), int(time_m.group(2)), float(time_m.group(3))
+                current_sec = h * 3600 + m * 60 + s
+                self.progress_signal.emit(min(current_sec / duration_sec * 100, 100.0))
+
+        self._process.wait()
+        if self._process.returncode == 0:
+            self.log_signal.emit(f"转换完成：{self.dst}", "success")
+            self.progress_signal.emit(100.0)
+            self.finished_signal.emit(True, self.dst)
+        else:
+            self.log_signal.emit(f"ffmpeg 异常退出，退出码：{self._process.returncode}", "error")
+            self.finished_signal.emit(False, "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 彩色日志组件
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ColorLogWidget(QTextEdit):
+    COLORS = {
+        "info":     "#e0e0e0",
+        "success":  "#66bb6a",
+        "error":    "#ef5350",
+        "progress": "#ffca28",
+        "ts":       "#9e9e9e",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setFont(QFont("Consolas", 9))
+        self.setStyleSheet(
+            "QTextEdit {"
+            "  background-color: #1e1e1e;"
+            "  color: #e0e0e0;"
+            "  border: 1px solid #444;"
+            "  border-radius: 4px;"
+            "}"
+        )
+
+    def append_log(self, message: str, level: str = "info"):
+        ts     = datetime.now().strftime("[%H:%M:%S] ")
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.End)
+
+        fmt_ts = QTextCharFormat()
+        fmt_ts.setForeground(QColor(self.COLORS["ts"]))
+        cursor.insertText(ts, fmt_ts)
+
+        fmt_msg = QTextCharFormat()
+        fmt_msg.setForeground(QColor(self.COLORS.get(level, self.COLORS["info"])))
+        cursor.insertText(message + "\n", fmt_msg)
+
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
+    def clear_log(self):
+        self.clear()
+        self.append_log("日志已清空", "info")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 设置对话框
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SettingsDialog(QDialog):
+    def __init__(self, dl_manager: DownloaderManager, ff_manager: FFmpegManager, parent=None):
+        super().__init__(parent)
+        self.dl_manager = dl_manager
+        self.ff_manager = ff_manager
+        self.setWindowTitle("设置")
+        self.setMinimumWidth(560)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        form   = QFormLayout()
+        form.setSpacing(10)
+
+        # N_m3u8DL-CLI 路径
+        self.dl_path_edit = QLineEdit(self.dl_manager.get_custom_path())
+        self.dl_path_edit.setPlaceholderText("留空则自动查找 tools/ 目录")
+        dl_btn = QPushButton("浏览...")
+        dl_btn.setFixedWidth(70)
+        dl_btn.clicked.connect(self._browse_dl)
+        dl_row = QHBoxLayout()
+        dl_row.addWidget(self.dl_path_edit)
+        dl_row.addWidget(dl_btn)
+        form.addRow("N_m3u8DL-CLI 路径：", dl_row)
+
+        # ffmpeg 路径
+        self.ff_path_edit = QLineEdit(self.ff_manager.get_custom_path())
+        self.ff_path_edit.setPlaceholderText("留空则自动查找 tools/ffmpeg.exe")
+        ff_btn = QPushButton("浏览...")
+        ff_btn.setFixedWidth(70)
+        ff_btn.clicked.connect(self._browse_ff)
+        ff_row = QHBoxLayout()
+        ff_row.addWidget(self.ff_path_edit)
+        ff_row.addWidget(ff_btn)
+        form.addRow("FFmpeg 路径：", ff_row)
+
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "提示：若不手动指定，程序会自动在 tools/ 目录下查找对应可执行文件。\n"
+            "若工具不存在，可从以下地址下载：\n"
+            "  N_m3u8DL-CLI：https://github.com/nilaoda/N_m3u8DL-CLI/releases\n"
+            "  FFmpeg：https://ffmpeg.org/download.html"
+        )
+        hint.setStyleSheet("color: #aaa; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _browse_dl(self):
+        p, _ = QFileDialog.getOpenFileName(self, "选择 N_m3u8DL-CLI", "", "可执行文件 (*.exe)")
+        if p:
+            self.dl_path_edit.setText(p)
+
+    def _browse_ff(self):
+        p, _ = QFileDialog.getOpenFileName(self, "选择 ffmpeg.exe", "", "可执行文件 (*.exe)")
+        if p:
+            self.ff_path_edit.setText(p)
+
+    def _accept(self):
+        self.dl_manager.set_custom_path(self.dl_path_edit.text())
+        self.ff_manager.set_custom_path(self.ff_path_edit.text())
+        self.accept()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 下载面板
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DownloadPanel(QWidget):
+    status_signal = pyqtSignal(str)
+
+    def __init__(self, dl_manager: DownloaderManager, ff_manager: FFmpegManager, parent=None):
+        super().__init__(parent)
+        self.dl_manager  = dl_manager
+        self.ff_manager  = ff_manager
+        self._worker: DownloadWorker = None
+        self._thread: threading.Thread = None
+        self._running      = False
+        self._is_local_m3u8 = False
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        # ── 设置区 ──────────────────────────────────────────────────────────────
+        grp  = QGroupBox("下载设置")
+        grp.setStyleSheet("QGroupBox { font-weight: bold; }")
+        form = QFormLayout(grp)
+        form.setSpacing(8)
+
+        # URL + 导入本地 m3u8
+        url_row = QHBoxLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("输入 M3U8 地址 或 普通视频 URL...")
+        url_row.addWidget(self.url_edit)
+        import_btn = QPushButton("导入本地 .m3u8")
+        import_btn.setFixedWidth(130)
+        import_btn.clicked.connect(self._import_local_m3u8)
+        url_row.addWidget(import_btn)
+        form.addRow("视频地址：", url_row)
+
+        # 输出目录
+        dir_row = QHBoxLayout()
+        self.dir_edit = QLineEdit(
+            os.path.join(os.path.expanduser("~"), "Downloads", "M3U8_Downloads")
+        )
+        dir_row.addWidget(self.dir_edit)
+        dir_btn = QPushButton("浏览...")
+        dir_btn.setFixedWidth(70)
+        dir_btn.clicked.connect(self._browse_dir)
+        dir_row.addWidget(dir_btn)
+        form.addRow("输出目录：", dir_row)
+
+        # 文件名
+        self.name_edit = QLineEdit("output")
+        form.addRow("文件名：", self.name_edit)
+
+        # 输出格式
+        fmt_row = QHBoxLayout()
+        self.fmt_combo = QComboBox()
+        self.fmt_combo.addItems(["mp4", "mkv", "mov", "avi", "ts", "mp3", "aac", "flac"])
+        self.fmt_combo.setEditable(True)
+        self.fmt_combo.setCurrentText("mp4")
+        fmt_row.addWidget(self.fmt_combo)
+        fmt_row.addStretch()
+        form.addRow("输出格式：", fmt_row)
+
+        # 线程设置（上限 2048，与原版一致）
+        thread_row = QHBoxLayout()
+        self.max_spin = QSpinBox()
+        self.max_spin.setRange(1, 2048)
+        self.max_spin.setValue(16)
+        self.min_spin = QSpinBox()
+        self.min_spin.setRange(1, 2048)
+        self.min_spin.setValue(8)
+        thread_row.addWidget(QLabel("最高线程："))
+        thread_row.addWidget(self.max_spin)
+        thread_row.addSpacing(20)
+        thread_row.addWidget(QLabel("最低线程："))
+        thread_row.addWidget(self.min_spin)
+        thread_row.addStretch()
+        form.addRow("线程设置：", thread_row)
+
+        root.addWidget(grp)
+
+        # ── 进度区 ──────────────────────────────────────────────────────────────
+        grp_prog = QGroupBox("下载进度")
+        grp_prog.setStyleSheet("QGroupBox { font-weight: bold; }")
+        prog_layout = QVBoxLayout(grp_prog)
+
+        self.progress_label = QLabel("就绪")
+        prog_layout.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        prog_layout.addWidget(self.progress_bar)
+
+        self.speed_label = QLabel("速度：—")
+        self.speed_label.setStyleSheet("color: #4CAF50;")
+        prog_layout.addWidget(self.speed_label)
+
+        root.addWidget(grp_prog)
+
+        # ── 按钮区 ──────────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton("开始下载")
+        self.start_btn.setStyleSheet(
+            "background:#4CAF50;color:white;font-weight:bold;padding:8px 24px;"
+        )
+        self.start_btn.clicked.connect(self.start_download)
+
+        self.stop_btn = QPushButton("停止下载")
+        self.stop_btn.setStyleSheet(
+            "background:#F44336;color:white;font-weight:bold;padding:8px 24px;"
+        )
+        self.stop_btn.clicked.connect(self.stop_download)
+        self.stop_btn.setEnabled(False)
+
+        open_btn = QPushButton("打开输出目录")
+        open_btn.setStyleSheet("padding:8px 16px;")
+        open_btn.clicked.connect(self._open_dir)
+
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(open_btn)
+        btn_row.addStretch()
+        root.addLayout(btn_row)
+
+        # ── 日志区 ──────────────────────────────────────────────────────────────
+        grp_log = QGroupBox("实时日志")
+        grp_log.setStyleSheet("QGroupBox { font-weight: bold; }")
+        log_layout = QVBoxLayout(grp_log)
+
+        self.log_widget = ColorLogWidget()
+        log_layout.addWidget(self.log_widget)
+
+        clear_btn = QPushButton("清空日志")
+        clear_btn.setFixedWidth(90)
+        clear_btn.clicked.connect(self.log_widget.clear_log)
+        log_layout.addWidget(clear_btn, alignment=Qt.AlignRight)
+
+        root.addWidget(grp_log, stretch=1)
+
+    # ── 槽方法 ──────────────────────────────────────────────────────────────────
+
+    def _import_local_m3u8(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择本地 .m3u8 文件", "",
+            "M3U8 文件 (*.m3u8);;所有文件 (*)"
+        )
+        if path:
+            self.url_edit.setText(path)
+            self._is_local_m3u8 = True
+            self.log_widget.append_log(f"已导入本地 M3U8：{path}", "success")
+
+    def _browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录", self.dir_edit.text())
+        if d:
+            self.dir_edit.setText(d)
+
+    def _open_dir(self):
+        d = self.dir_edit.text().strip()
+        if d and os.path.isdir(d):
+            os.startfile(d)
+        else:
+            QMessageBox.information(self, "提示", "目录不存在，请先设置有效的输出目录。")
+
+    def start_download(self):
+        if self._running:
+            QMessageBox.warning(self, "警告", "下载正在进行中！")
+            return
+
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.critical(self, "错误", "请输入视频地址！")
+            return
+
+        work_dir  = self.dir_edit.text().strip()
+        save_name = self.name_edit.text().strip()
+
+        if not work_dir:
+            QMessageBox.critical(self, "错误", "请设置输出目录！")
+            return
+        if not save_name:
+            QMessageBox.critical(self, "错误", "请输入文件名！")
+            return
+
+        illegal = set('<>:"|?*\\/').intersection(save_name)
+        if illegal:
+            QMessageBox.critical(self, "错误", f"文件名含非法字符：{''.join(illegal)}")
+            return
+
+        max_t = self.max_spin.value()
+        min_t = self.min_spin.value()
+        if min_t > max_t:
+            QMessageBox.critical(self, "错误", "最低线程数不能大于最高线程数！")
+            return
+
+        dl_path  = self.dl_manager.get_downloader_path()
+        ff_path  = self.ff_manager.get_ffmpeg_path()
+        out_fmt  = self.fmt_combo.currentText().strip().lower().strip(".")
+
+        # 判断是否为本地 m3u8
+        is_local = self._is_local_m3u8 or (
+            os.path.isfile(url) and url.lower().endswith(".m3u8")
+        )
+        # 若 URL 已被用户手动改为网络地址，重置标志，并用 path 部分判断后缀
+        if not os.path.isfile(url):
+            self._is_local_m3u8 = False
+            from urllib.parse import urlparse as _up
+            is_local = _up(url).path.lower().endswith(".m3u8")
+
+        self._worker = DownloadWorker(
+            url=url,
+            work_dir=work_dir,
+            save_name=save_name,
+            max_threads=max_t,
+            min_threads=min_t,
+            downloader_path=dl_path,
+            ffmpeg_path=ff_path,
+            output_format=out_fmt,
+            is_local_m3u8=is_local,
+        )
+        self._worker.log_signal.connect(self.log_widget.append_log)
+        self._worker.progress_signal.connect(self._on_progress)
+        self._worker.status_signal.connect(self._on_status)
+        self._worker.speed_signal.connect(lambda s: self.speed_label.setText(f"速度：{s}"))
+        self._worker.finished_signal.connect(self._on_finished)
+
+        self._running = True
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("正在启动...")
+        self.status_signal.emit("下载中...")
+
+        self._thread = threading.Thread(target=self._worker.run, daemon=True)
+        self._thread.start()
+
+        self.log_widget.append_log("=" * 60, "info")
+        self.log_widget.append_log(
+            f"任务启动  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "info"
+        )
+        self.log_widget.append_log(f"目标地址：{url}", "info")
+        self.log_widget.append_log(f"输出目录：{work_dir}", "info")
+        self.log_widget.append_log(f"输出格式：{out_fmt}", "info")
+
+    def stop_download(self):
+        if self._worker:
+            self._worker.stop()
+        self.log_widget.append_log("已发送停止信号...", "error")
+        self.status_signal.emit("正在停止...")
+
+    def _on_progress(self, pct: float):
+        self.progress_bar.setValue(int(pct))
+        self.progress_label.setText(f"进度：{pct:.1f}%")
+
+    def _on_status(self, msg: str):
+        self.progress_label.setText(msg)
+        self.status_signal.emit(msg)
+
+    def _on_finished(self, success: bool, out_path: str):
+        self._running = False
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        if success:
+            self.progress_bar.setValue(100)
+            self.progress_label.setText("完成 ✓")
+            self.log_widget.append_log(f"任务完成！输出文件：{out_path}", "success")
+            self.status_signal.emit(f"完成：{os.path.basename(out_path)}")
+            reply = QMessageBox.question(
+                self, "下载完成",
+                f"任务已完成！\n\n文件：{out_path}\n\n是否打开输出目录？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._open_dir()
+        else:
+            self.progress_label.setText("失败 ✗")
+            self.log_widget.append_log("任务失败，请查看上方日志", "error")
+            self.status_signal.emit("下载失败")
+
+    def terminate_all(self):
+        if self._worker:
+            self._worker.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 转换面板
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ConvertPanel(QWidget):
+    status_signal = pyqtSignal(str)
+
+    def __init__(self, ff_manager: FFmpegManager, parent=None):
+        super().__init__(parent)
+        self.ff_manager = ff_manager
+        self._worker: ConvertWorker = None
+        self._thread: threading.Thread = None
+        self._running = False
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        # ── 设置区 ──────────────────────────────────────────────────────────────
+        grp  = QGroupBox("转换设置")
+        grp.setStyleSheet("QGroupBox { font-weight: bold; }")
+        form = QFormLayout(grp)
+        form.setSpacing(8)
+
+        # 输入文件
+        in_row = QHBoxLayout()
+        self.in_edit = QLineEdit()
+        self.in_edit.setPlaceholderText("选择或拖入视频/音频文件...")
+        in_row.addWidget(self.in_edit)
+        in_btn = QPushButton("浏览...")
+        in_btn.setFixedWidth(70)
+        in_btn.clicked.connect(self._browse_input)
+        in_row.addWidget(in_btn)
+        form.addRow("输入文件：", in_row)
+
+        # 输出目录
+        out_dir_row = QHBoxLayout()
+        self.out_dir_edit = QLineEdit(
+            os.path.join(os.path.expanduser("~"), "Downloads", "M3U8_Downloads")
+        )
+        out_dir_row.addWidget(self.out_dir_edit)
+        out_dir_btn = QPushButton("浏览...")
+        out_dir_btn.setFixedWidth(70)
+        out_dir_btn.clicked.connect(self._browse_out_dir)
+        out_dir_row.addWidget(out_dir_btn)
+        form.addRow("输出目录：", out_dir_row)
+
+        # 输出文件名
+        self.out_name_edit = QLineEdit()
+        self.out_name_edit.setPlaceholderText("留空则与输入文件同名")
+        form.addRow("输出文件名：", self.out_name_edit)
+
+        # 输出格式
+        fmt_row = QHBoxLayout()
+        self.fmt_combo = QComboBox()
+        self.fmt_combo.addItems(
+            ["mp4", "mkv", "mov", "avi", "ts", "mp3", "aac", "flac", "wav", "webm"]
+        )
+        self.fmt_combo.setEditable(True)
+        self.fmt_combo.setCurrentText("mp4")
+        fmt_row.addWidget(self.fmt_combo)
+        fmt_row.addStretch()
+        form.addRow("输出格式：", fmt_row)
+
+        # 自定义 ffmpeg 参数
+        self.extra_edit = QLineEdit()
+        self.extra_edit.setPlaceholderText("可选，如：-vcodec libx264 -crf 23")
+        form.addRow("自定义参数：", self.extra_edit)
+
+        root.addWidget(grp)
+
+        # ── 进度区 ──────────────────────────────────────────────────────────────
+        grp_prog = QGroupBox("转换进度")
+        grp_prog.setStyleSheet("QGroupBox { font-weight: bold; }")
+        prog_layout = QVBoxLayout(grp_prog)
+
+        self.progress_label = QLabel("就绪")
+        prog_layout.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        prog_layout.addWidget(self.progress_bar)
+
+        root.addWidget(grp_prog)
+
+        # ── 按钮区 ──────────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton("开始转换")
+        self.start_btn.setStyleSheet(
+            "background:#2196F3;color:white;font-weight:bold;padding:8px 24px;"
+        )
+        self.start_btn.clicked.connect(self.start_convert)
+
+        self.stop_btn = QPushButton("停止转换")
+        self.stop_btn.setStyleSheet(
+            "background:#F44336;color:white;font-weight:bold;padding:8px 24px;"
+        )
+        self.stop_btn.clicked.connect(self.stop_convert)
+        self.stop_btn.setEnabled(False)
+
+        open_btn = QPushButton("打开输出目录")
+        open_btn.setStyleSheet("padding:8px 16px;")
+        open_btn.clicked.connect(self._open_out_dir)
+
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(open_btn)
+        btn_row.addStretch()
+        root.addLayout(btn_row)
+
+        # ── 日志区 ──────────────────────────────────────────────────────────────
+        grp_log = QGroupBox("转换日志")
+        grp_log.setStyleSheet("QGroupBox { font-weight: bold; }")
+        log_layout = QVBoxLayout(grp_log)
+
+        self.log_widget = ColorLogWidget()
+        log_layout.addWidget(self.log_widget)
+
+        clear_btn = QPushButton("清空日志")
+        clear_btn.setFixedWidth(90)
+        clear_btn.clicked.connect(self.log_widget.clear_log)
+        log_layout.addWidget(clear_btn, alignment=Qt.AlignRight)
+
+        root.addWidget(grp_log, stretch=1)
+
+    # ── 槽方法 ──────────────────────────────────────────────────────────────────
+
+    def _browse_input(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择输入文件", "",
+            "视频/音频文件 (*.mp4 *.mkv *.mov *.avi *.ts *.flv *.mp3 *.aac *.flac *.wav *.webm *.m4v);;所有文件 (*)"
+        )
+        if path:
+            self.in_edit.setText(path)
+            base = os.path.splitext(os.path.basename(path))[0]
+            self.out_name_edit.setText(base)
+
+    def _browse_out_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录", self.out_dir_edit.text())
+        if d:
+            self.out_dir_edit.setText(d)
+
+    def _open_out_dir(self):
+        d = self.out_dir_edit.text().strip()
+        if d and os.path.isdir(d):
+            os.startfile(d)
+        else:
+            QMessageBox.information(self, "提示", "目录不存在，请先设置有效的输出目录。")
+
+    def start_convert(self):
+        if self._running:
+            QMessageBox.warning(self, "警告", "转换正在进行中！")
+            return
+
+        src = self.in_edit.text().strip()
+        if not src or not os.path.isfile(src):
+            QMessageBox.critical(self, "错误", "请选择有效的输入文件！")
+            return
+
+        out_dir = self.out_dir_edit.text().strip()
+        if not out_dir:
+            QMessageBox.critical(self, "错误", "请设置输出目录！")
+            return
+
+        out_name = self.out_name_edit.text().strip() or os.path.splitext(os.path.basename(src))[0]
+        fmt      = self.fmt_combo.currentText().strip().lower().strip(".")
+        if not fmt:
+            QMessageBox.critical(self, "错误", "请选择输出格式！")
+            return
+
+        ff_path = self.ff_manager.get_ffmpeg_path()
+        if not ff_path:
+            QMessageBox.critical(
+                self, "错误",
+                "未找到 ffmpeg.exe！\n请在[工具 - 设置]中指定 ffmpeg 路径。"
+            )
+            return
+
+        os.makedirs(out_dir, exist_ok=True)
+        dst   = os.path.join(out_dir, f"{out_name}.{fmt}")
+        extra = self.extra_edit.text().strip()
+
+        self._worker = ConvertWorker(ff_path, src, dst, extra)
+        self._worker.log_signal.connect(self.log_widget.append_log)
+        self._worker.progress_signal.connect(self._on_progress)
+        self._worker.status_signal.connect(self._on_status)
+        self._worker.finished_signal.connect(self._on_finished)
+
+        self._running = True
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("正在启动...")
+        self.status_signal.emit("转换中...")
+
+        self._thread = threading.Thread(target=self._worker.run, daemon=True)
+        self._thread.start()
+
+        self.log_widget.append_log("=" * 60, "info")
+        self.log_widget.append_log(
+            f"转换任务启动  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "info"
+        )
+        self.log_widget.append_log(f"输入：{src}", "info")
+        self.log_widget.append_log(f"输出：{dst}", "info")
+
+    def stop_convert(self):
+        if self._worker:
+            self._worker.stop()
+        self.log_widget.append_log("已发送停止信号...", "error")
+        self.status_signal.emit("正在停止...")
+
+    def _on_progress(self, pct: float):
+        self.progress_bar.setValue(int(pct))
+        self.progress_label.setText(f"进度：{pct:.1f}%")
+
+    def _on_status(self, msg: str):
+        self.progress_label.setText(msg)
+        self.status_signal.emit(msg)
+
+    def _on_finished(self, success: bool, out_path: str):
+        self._running = False
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        if success:
+            self.progress_bar.setValue(100)
+            self.progress_label.setText("完成 ✓")
+            self.log_widget.append_log(f"转换完成！输出：{out_path}", "success")
+            self.status_signal.emit(f"完成：{os.path.basename(out_path)}")
+            reply = QMessageBox.question(
+                self, "转换完成",
+                f"转换完成！\n\n文件：{out_path}\n\n是否打开输出目录？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._open_out_dir()
+        else:
+            self.progress_label.setText("失败 ✗")
+            self.log_widget.append_log("转换失败，请查看上方日志", "error")
+            self.status_signal.emit("转换失败")
+
+    def terminate_all(self):
+        if self._worker:
+            self._worker.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 主窗口
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("M3U8视频下载器 2.0")
+        self.resize(960, 700)
+        self.setMinimumSize(800, 580)
+
+        icon_path = os.path.join(get_base_dir(), "fm.ico")
+        if os.path.isfile(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        self.dl_manager = DownloaderManager()
+        self.ff_manager = FFmpegManager()
+
+        self._build_menu()
+        self._build_central()
+        self._build_statusbar()
+        self._startup_check()
+
+    # ── UI 构建 ──────────────────────────────────────────────────────────────────
+
+    def _build_menu(self):
+        mb = self.menuBar()
+
+        func_menu = mb.addMenu("功能")
+        a1 = QAction("下载视频", self)
+        a1.setShortcut("Ctrl+1")
+        a1.triggered.connect(lambda: self._switch_panel(0))
+        func_menu.addAction(a1)
+
+        a2 = QAction("视频格式转换", self)
+        a2.setShortcut("Ctrl+2")
+        a2.triggered.connect(lambda: self._switch_panel(1))
+        func_menu.addAction(a2)
+
+        tool_menu = mb.addMenu("工具")
+        a_set = QAction("设置...", self)
+        a_set.setShortcut("Ctrl+,")
+        a_set.triggered.connect(self._open_settings)
+        tool_menu.addAction(a_set)
+
+        a_tools = QAction("打开 tools 目录", self)
+        a_tools.triggered.connect(self._open_tools_dir)
+        tool_menu.addAction(a_tools)
+
+        help_menu = mb.addMenu("帮助")
+        a_about = QAction("关于", self)
+        a_about.triggered.connect(self._show_about)
+        help_menu.addAction(a_about)
+
+    def _build_central(self):
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self.download_panel = DownloadPanel(self.dl_manager, self.ff_manager)
+        self.download_panel.status_signal.connect(self._update_status)
+        self.stack.addWidget(self.download_panel)   # index 0
+
+        self.convert_panel = ConvertPanel(self.ff_manager)
+        self.convert_panel.status_signal.connect(self._update_status)
+        self.stack.addWidget(self.convert_panel)    # index 1
+
+        self.stack.setCurrentIndex(0)
+
+    def _build_statusbar(self):
+        sb = self.statusBar()
+        self.status_label = QLabel("就绪")
+        sb.addWidget(self.status_label, 1)
+        self.tool_status_label = QLabel()
+        sb.addPermanentWidget(self.tool_status_label)
+
+    # ── 启动检查 ──────────────────────────────────────────────────────────────────
+
+    def _startup_check(self):
+        dl_ok = bool(self.dl_manager.get_downloader_path())
+        ff_ok = self.ff_manager.is_available()
+
+        if dl_ok and ff_ok:
+            self.tool_status_label.setText("✔ N_m3u8DL-CLI  ✔ ffmpeg")
+            self.tool_status_label.setStyleSheet("color: #4CAF50;")
+        else:
+            parts = []
+            if not dl_ok:
+                parts.append("✘ N_m3u8DL-CLI 未找到")
+            if not ff_ok:
+                parts.append("✘ ffmpeg 未找到")
+            self.tool_status_label.setText("  ".join(parts))
+            self.tool_status_label.setStyleSheet("color: #F44336;")
+            QTimer.singleShot(500, lambda: self._warn_missing_tools(dl_ok, ff_ok))
+
+    def _warn_missing_tools(self, dl_ok: bool, ff_ok: bool):
+        lines = ["以下工具未找到，部分功能将不可用：\n"]
+        if not dl_ok:
+            lines.append("• N_m3u8DL-CLI — M3U8 下载功能")
+        if not ff_ok:
+            lines.append("• ffmpeg.exe — 格式转换功能")
+        lines.append("\n请将工具放至 tools/ 目录，或在[工具 - 设置]中手动指定路径。")
+        QMessageBox.warning(self, "工具缺失", "\n".join(lines))
+
+    # ── 面板切换 / 菜单响应 ──────────────────────────────────────────────────────
+
+    def _switch_panel(self, idx: int):
+        self.stack.setCurrentIndex(idx)
+        self._update_status(["下载视频", "视频格式转换"][idx])
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self.dl_manager, self.ff_manager, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._startup_check()
+            self._update_status("设置已保存")
+
+    def _open_tools_dir(self):
+        d = get_tools_dir()
+        os.makedirs(d, exist_ok=True)
+        os.startfile(d)
+
+    def _show_about(self):
+        QMessageBox.about(
+            self, "关于 M3U8视频下载器 2.0",
+            "<b>M3U8视频下载器 2.0</b><br><br>"
+            "基于 PyQt5 构建<br>"
+            "M3U8 下载核心逻辑与原版完全一致<br><br>"
+            "使用工具：<br>"
+            "• N_m3u8DL-CLI（M3U8 下载）<br>"
+            "• ffmpeg（格式转换）"
+        )
+
+    def _update_status(self, msg: str):
+        self.status_label.setText(msg)
+
+    # ── 窗口关闭 ──────────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        self.download_panel.terminate_all()
+        self.convert_panel.terminate_all()
+        event.accept()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 入口
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    root = tk.Tk()
-    app = M3U8DownloaderGUI(root)
-    
-    # 设置关闭窗口时的处理
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    
-    # 窗口居中显示
-    root.update_idletasks()
-    width = root.winfo_width()
-    height = root.winfo_height()
-    x = (root.winfo_screenwidth() // 2) - (width // 2)
-    y = (root.winfo_screenheight() // 2) - (height // 2)
-    root.geometry(f'{width}x{height}+{x}+{y}')
-    
-    # 运行程序
-    root.mainloop()
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    # 暗色调色板
+    palette = QPalette()
+    palette.setColor(QPalette.Window,          QColor(45,  45,  45))
+    palette.setColor(QPalette.WindowText,      QColor(220, 220, 220))
+    palette.setColor(QPalette.Base,            QColor(35,  35,  35))
+    palette.setColor(QPalette.AlternateBase,   QColor(53,  53,  53))
+    palette.setColor(QPalette.ToolTipBase,     QColor(25,  25,  25))
+    palette.setColor(QPalette.ToolTipText,     QColor(220, 220, 220))
+    palette.setColor(QPalette.Text,            QColor(220, 220, 220))
+    palette.setColor(QPalette.Button,          QColor(53,  53,  53))
+    palette.setColor(QPalette.ButtonText,      QColor(220, 220, 220))
+    palette.setColor(QPalette.BrightText,      Qt.red)
+    palette.setColor(QPalette.Link,            QColor(42,  130, 218))
+    palette.setColor(QPalette.Highlight,       QColor(42,  130, 218))
+    palette.setColor(QPalette.HighlightedText, Qt.black)
+    app.setPalette(palette)
+
+    win = MainWindow()
+    win.show()
+
+    # 居中
+    screen = app.primaryScreen().geometry()
+    win.move(
+        (screen.width()  - win.width())  // 2,
+        (screen.height() - win.height()) // 2,
+    )
+
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
