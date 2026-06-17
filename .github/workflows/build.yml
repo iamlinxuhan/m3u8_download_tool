@@ -57,11 +57,10 @@ jobs:
             --hidden-import Crypto.Cipher.AES `
             m3u8_download_2.0.py
 
-      - name: Setup NSIS
+      - name: Setup NSIS (chocolatey)
         run: |
-          Invoke-WebRequest -Uri "https://sourceforge.net/projects/nsis/files/NSIS%203/3.09/nsis-3.09.zip/download" -OutFile nsis.zip
-          Expand-Archive -Path nsis.zip -DestinationPath nsis
-          echo "${{ github.workspace }}\m3u8_download_2.0\nsis\nsis-3.09" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          choco install nsis --version=3.09 -y --no-progress
+          echo "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Create NSIS Installer Script
         run: |
