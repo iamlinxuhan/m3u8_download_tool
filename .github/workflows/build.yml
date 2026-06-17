@@ -231,16 +231,18 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           PKG_NAME="m3u8-downloader"
-          RPM_NAME="${PKG_NAME}-${VERSION}-1.x86_64"
-          RPM_FILE="${RPM_NAME}.rpm"
-          BUILDROOT="/tmp/rpm-build"
+          RPM_FILE="${PKG_NAME}-${VERSION}-1.x86_64.rpm"
+          # 使用独立目录作为 fpm 输入，避免 rpmbuild 的 %install 清理冲突
+          RPM_SRC="/tmp/rpm-src"
 
-          mkdir -p ${BUILDROOT}/{usr/bin,usr/share/applications,usr/share/icons/hicolor/256x256/apps,usr/share/doc/${PKG_NAME}}
+          rm -rf ${RPM_SRC}
+          mkdir -p ${RPM_SRC}/usr/bin
+          mkdir -p ${RPM_SRC}/usr/share/applications
 
-          cp dist/m3u8-downloader ${BUILDROOT}/usr/bin/
-          chmod 755 ${BUILDROOT}/usr/bin/m3u8-downloader
+          cp dist/m3u8-downloader ${RPM_SRC}/usr/bin/
+          chmod 755 ${RPM_SRC}/usr/bin/m3u8-downloader
 
-          cat > ${BUILDROOT}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
+          cat > ${RPM_SRC}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
           [Desktop Entry]
           Name=M3U8视频下载器
           Name[en]=M3U8 Video Downloader
@@ -252,61 +254,26 @@ jobs:
           Terminal=false
           DESKTOP_EOF
 
-          mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES ~/rpmbuild/SPECS ~/rpmbuild/SRPMS
+          # 直接使用 fpm 构建 RPM（比 rpmbuild 更可靠）
+          sudo apt-get install -y ruby
+          sudo gem install fpm --no-document
+          fpm -s dir -t rpm \
+            -n ${PKG_NAME} \
+            -v ${VERSION} \
+            --iteration 1 \
+            --architecture x86_64 \
+            --depends ffmpeg \
+            --depends libxcb \
+            --depends libglx-mesa0 \
+            --description "M3U8视频下载器 - 跨平台M3U8视频下载工具" \
+            --url "https://github.com/iamlinxuhan/m3u8_download_tool" \
+            --license MIT \
+            --maintainer "iamlinxuhan <iamlinxuhan@github.com>" \
+            -C ${RPM_SRC} \
+            usr/bin/m3u8-downloader \
+            usr/share/applications/m3u8-downloader.desktop
 
-          cat > ~/rpmbuild/SPECS/${PKG_NAME}.spec << SPEC_EOF
-          Name:           ${PKG_NAME}
-          Version:        ${VERSION}
-          Release:        1%{?dist}
-          Summary:        M3U8视频下载器 - 跨平台M3U8视频下载工具
-          License:        MIT
-          URL:            https://github.com/iamlinxuhan/m3u8_download_tool
-          BuildArch:      x86_64
-          Requires:       ffmpeg, libxcb, libglx, libEGL, libOpenGL
-
-          %description
-          基于 PyQt5 的跨平台 M3U8 视频下载工具，内置原生 Python M3U8 下载引擎，
-          支持 AES-128 加密解密、多线程下载、格式转换。
-
-          %install
-          mkdir -p %{buildroot}/usr/bin
-          mkdir -p %{buildroot}/usr/share/applications
-          cp ${BUILDROOT}/usr/bin/m3u8-downloader %{buildroot}/usr/bin/
-          cp ${BUILDROOT}/usr/share/applications/m3u8-downloader.desktop %{buildroot}/usr/share/applications/
-
-          %files
-          /usr/bin/m3u8-downloader
-          /usr/share/applications/m3u8-downloader.desktop
-
-          %changelog
-          * $(date '+%a %b %d %Y') iamlinxuhan <iamlinxuhan@github.com> - ${VERSION}-1
-          - Release ${VERSION}
-          SPEC_EOF
-
-          rpmbuild -bb --buildroot ${BUILDROOT} ~/rpmbuild/SPECS/${PKG_NAME}.spec || true
-          if [ -f ~/rpmbuild/RPMS/x86_64/${RPM_FILE} ]; then
-            cp ~/rpmbuild/RPMS/x86_64/${RPM_FILE} .
-          fi
-
-          # fallback: 手动用 fpm 构建
-          if [ ! -f "${RPM_FILE}" ]; then
-            sudo apt-get install -y ruby
-            sudo gem install fpm --no-document
-            fpm -s dir -t rpm \
-              -n ${PKG_NAME} \
-              -v ${VERSION} \
-              --architecture x86_64 \
-              --depends ffmpeg \
-              --depends libxcb \
-              --depends libglx-mesa0 \
-              --description "M3U8视频下载器 - 跨平台M3U8视频下载工具" \
-              --url "https://github.com/iamlinxuhan/m3u8_download_tool" \
-              --license MIT \
-              --maintainer "iamlinxuhan <iamlinxuhan@github.com>" \
-              -C ${BUILDROOT} \
-              usr/bin/m3u8-downloader \
-              usr/share/applications/m3u8-downloader.desktop
-          fi
+          echo "RPM built: $(ls ${RPM_FILE} 2>/dev/null || echo 'NOT FOUND')"
 
       - name: Upload .rpm
         uses: actions/upload-artifact@v4
