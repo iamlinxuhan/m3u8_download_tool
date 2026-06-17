@@ -644,7 +644,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pillow
 
       - name: Install ffmpeg
         run: |
@@ -657,9 +657,9 @@ jobs:
           VERSION="${VERSION#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Build with PyInstaller (Universal)
+      - name: Build with PyInstaller (macOS .app bundle)
         run: |
-          pyinstaller --onefile --windowed \
+          pyinstaller --onedir --windowed \
             --name "M3U8_Downloader" \
             --icon=fm.ico \
             --add-data "fm.ico:." \
@@ -673,58 +673,15 @@ jobs:
             --osx-bundle-identifier "com.github.iamlinxuhan.m3u8-downloader" \
             m3u8_download_2.0.py
 
-      - name: Create .app Bundle
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          APP_NAME="M3U8_Downloader"
-          APP_DIR="${APP_NAME}.app"
-          CONTENTS="${APP_DIR}/Contents"
-          MACOS="${CONTENTS}/MacOS"
-          RESOURCES="${CONTENTS}/Resources"
-
-          mkdir -p "${MACOS}" "${RESOURCES}"
-
-          # 移动二进制
-          cp dist/${APP_NAME} "${MACOS}/"
-          chmod +x "${MACOS}/${APP_NAME}"
-
-          # Info.plist
-          cat > "${CONTENTS}/Info.plist" << INFO_EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>M3U8视频下载器</string>
-            <key>CFBundleDisplayName</key>
-            <string>M3U8视频下载器</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.github.iamlinxuhan.m3u8-downloader</string>
-            <key>CFBundleVersion</key>
-            <string>${VERSION}</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${VERSION}</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleExecutable</key>
-            <string>${APP_NAME}</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>10.14</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-          </dict>
-          </plist>
-          INFO_EOF
-
       - name: Create .dmg
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           APP_NAME="M3U8_Downloader"
           DMG_NAME="${APP_NAME}-${VERSION}.dmg"
 
-          # 创建临时 DMG 目录
+          # PyInstaller --onedir --windowed 已自动生成 .app bundle 在 dist/ 下
           mkdir -p dmg_staging
-          cp -R "${APP_NAME}.app" dmg_staging/
+          cp -R "dist/${APP_NAME}.app" dmg_staging/
           ln -s /Applications dmg_staging/Applications
 
           # 创建 DMG
