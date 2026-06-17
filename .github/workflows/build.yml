@@ -139,7 +139,7 @@ jobs:
             ffmpeg \
             libxcb-xinerama0 \
             libxcb-cursor0 \
-            libgl1-mesa-glx \
+            libgl1 \
             libegl1 \
             libopengl0 \
             fakeroot \
@@ -206,7 +206,7 @@ jobs:
           Section: video
           Priority: optional
           Architecture: amd64
-          Depends: ffmpeg, libxcb-xinerama0, libxcb-cursor0, libgl1-mesa-glx, libegl1, libopengl0
+          Depends: ffmpeg, libxcb-xinerama0, libxcb-cursor0, libgl1 | libglx-mesa0, libegl1, libopengl0
           Maintainer: iamlinxuhan <iamlinxuhan@github.com>
           Description: M3U8视频下载器 2.0
            基于 PyQt5 的跨平台 M3U8 视频下载工具，
