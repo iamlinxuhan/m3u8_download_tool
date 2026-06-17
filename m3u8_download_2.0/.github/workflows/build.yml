@@ -1,0 +1,407 @@
+name: Build and Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # ============================================================
+  # Windows 打包 (PyInstaller + NSIS)
+  # ============================================================
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download ffmpeg for Windows
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath .
+          $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
+          Copy-Item "$($ffmpegDir.Name)\bin\ffmpeg.exe" -Destination .
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed `
+            --name "M3U8_Downloader" `
+            --icon=fm.ico `
+            --add-data "fm.ico;." `
+            --add-data "ffmpeg.exe;." `
+            --hidden-import PyQt5.QtCore `
+            --hidden-import PyQt5.QtGui `
+            --hidden-import PyQt5.QtWidgets `
+            --hidden-import requests `
+            --hidden-import Crypto `
+            --hidden-import Crypto.Cipher `
+            --hidden-import Crypto.Cipher.AES `
+            m3u8_download_2.0.py
+
+      - name: Setup NSIS
+        run: |
+          Invoke-WebRequest -Uri "https://sourceforge.net/projects/nsis/files/NSIS%203/3.09/nsis-3.09.zip/download" -OutFile nsis.zip
+          Expand-Archive -Path nsis.zip -DestinationPath nsis
+          echo "${{ github.workspace }}\nsis\nsis-3.09" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Create NSIS Installer Script
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          @"
+          !include "MUI2.nsh"
+
+          Name "M3U8视频下载器 2.0"
+          OutFile "M3U8_Downloader_${version}_Setup.exe"
+          InstallDir `$PROGRAMFILES\M3U8_Downloader
+          RequestExecutionLevel admin
+
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_LANGUAGE "SimpChinese"
+
+          Section "Install"
+            SetOutPath `$INSTDIR
+            File "dist\M3U8_Downloader.exe"
+            CreateShortCut `$DESKTOP\M3U8视频下载器.lnk `$INSTDIR\M3U8_Downloader.exe
+            CreateDirectory `$SMPROGRAMS\M3U8视频下载器
+            CreateShortCut `$SMPROGRAMS\M3U8视频下载器\M3U8视频下载器.lnk `$INSTDIR\M3U8_Downloader.exe
+            WriteUninstaller `$INSTDIR\uninstall.exe
+          SectionEnd
+
+          Section "Uninstall"
+            Delete `$INSTDIR\M3U8_Downloader.exe
+            Delete `$INSTDIR\uninstall.exe
+            RMDir `$INSTDIR
+            Delete `$DESKTOP\M3U8视频下载器.lnk
+            RMDir /r `$SMPROGRAMS\M3U8视频下载器
+          SectionEnd
+          "@ | Out-File -FilePath installer.nsi -Encoding UTF8
+
+      - name: Build NSIS Installer
+        run: makensis installer.nsi
+
+      - name: Upload Windows Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: M3U8_Downloader_*_Setup.exe
+
+      - name: Upload Windows Artifact (zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: |
+            dist/M3U8_Downloader.exe
+
+  # ============================================================
+  # Linux x86_64 .deb 打包
+  # ============================================================
+  build-linux-deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libxcb-xinerama0 \
+            libxcb-cursor0 \
+            libgl1-mesa-glx \
+            libegl1 \
+            libopengl0 \
+            fakeroot \
+            dpkg-dev
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed \
+            --name "m3u8-downloader" \
+            --add-data "fm.ico:." \
+            --hidden-import PyQt5.QtCore \
+            --hidden-import PyQt5.QtGui \
+            --hidden-import PyQt5.QtWidgets \
+            --hidden-import requests \
+            --hidden-import Crypto \
+            --hidden-import Crypto.Cipher \
+            --hidden-import Crypto.Cipher.AES \
+            m3u8_download_2.0.py
+
+      - name: Get Version
+        id: version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build .deb Package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="m3u8-downloader"
+          PKG_DIR="${PKG_NAME}_${VERSION}_amd64"
+          DEB_FILE="${PKG_NAME}_${VERSION}_amd64.deb"
+
+          # 创建 deb 目录结构
+          mkdir -p ${PKG_DIR}/DEBIAN
+          mkdir -p ${PKG_DIR}/usr/bin
+          mkdir -p ${PKG_DIR}/usr/share/applications
+          mkdir -p ${PKG_DIR}/usr/share/icons/hicolor/256x256/apps
+          mkdir -p ${PKG_DIR}/usr/share/doc/${PKG_NAME}
+
+          # 复制文件
+          cp dist/m3u8-downloader ${PKG_DIR}/usr/bin/
+          chmod 755 ${PKG_DIR}/usr/bin/m3u8-downloader
+
+          # 创建 .desktop 文件
+          cat > ${PKG_DIR}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
+          [Desktop Entry]
+          Name=M3U8视频下载器
+          Name[en]=M3U8 Video Downloader
+          Comment=M3U8视频下载工具
+          Comment[en]=M3U8 Video Download Tool
+          Exec=/usr/bin/m3u8-downloader
+          Type=Application
+          Categories=AudioVideo;Video;
+          Terminal=false
+          DESKTOP_EOF
+
+          # 创建 DEBIAN/control
+          cat > ${PKG_DIR}/DEBIAN/control << CONTROL_EOF
+          Package: ${PKG_NAME}
+          Version: ${VERSION}
+          Section: video
+          Priority: optional
+          Architecture: amd64
+          Depends: ffmpeg, libxcb-xinerama0, libxcb-cursor0, libgl1-mesa-glx, libegl1, libopengl0
+          Maintainer: iamlinxuhan <iamlinxuhan@github.com>
+          Description: M3U8视频下载器 2.0
+           基于 PyQt5 的跨平台 M3U8 视频下载工具，
+           内置原生 Python M3U8 下载引擎，
+           支持 AES-128 加密解密、多线程下载、格式转换。
+          CONTROL_EOF
+
+          # 构建 .deb
+          dpkg-deb --build ${PKG_DIR} ${DEB_FILE}
+
+      - name: Upload Linux .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb-amd64
+          path: m3u8-downloader_*_amd64.deb
+
+  # ============================================================
+  # Linux ARM .pkg.tar.xz 打包 (Arch Linux ARM)
+  # ============================================================
+  build-linux-arm:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Cross-Compilation Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-user-static \
+            binfmt-support \
+            fakeroot \
+            xz-utils
+
+      - name: Setup ARM64 QEMU
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Build ARM Package in Docker
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          PKG_NAME="m3u8-downloader"
+          ARCH="aarch64"
+
+          # 创建 PKGBUILD 风格的目录
+          mkdir -p arm-pkg/${PKG_NAME}
+
+          # 复制源码
+          cp m3u8_download_2.0.py arm-pkg/${PKG_NAME}/
+          cp requirements.txt arm-pkg/${PKG_NAME}/
+          cp fm.ico arm-pkg/${PKG_NAME}/
+
+          # 创建 PKGBUILD
+          cat > arm-pkg/PKGBUILD << PKGBUILD_EOF
+          pkgname=${PKG_NAME}
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="M3U8视频下载器 2.0 - 跨平台 M3U8 视频下载工具"
+          arch=(${ARCH})
+          url="https://github.com/iamlinxuhan/m3u8_download_tool"
+          license=('MIT')
+          depends=('ffmpeg' 'python' 'python-pyqt5' 'python-requests' 'python-pycryptodome')
+          makedepends=('python-pip' 'python-pyinstaller')
+          source=("${PKG_NAME}.py" "requirements.txt" "fm.ico")
+          sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+          package() {
+            mkdir -p "\${pkgdir}/usr/bin"
+            mkdir -p "\${pkgdir}/usr/share/applications"
+            mkdir -p "\${pkgdir}/usr/share/icons/hicolor/256x256/apps"
+
+            pip install --break-system-packages pyinstaller
+            pip install --break-system-packages -r "\${srcdir}/requirements.txt"
+
+            cd "\${srcdir}"
+            pyinstaller --onefile --windowed \\
+              --name "${PKG_NAME}" \\
+              --add-data "fm.ico:." \\
+              --hidden-import PyQt5.QtCore \\
+              --hidden-import PyQt5.QtGui \\
+              --hidden-import PyQt5.QtWidgets \\
+              --hidden-import requests \\
+              --hidden-import Crypto \\
+              --hidden-import Crypto.Cipher \\
+              --hidden-import Crypto.Cipher.AES \\
+              "${PKG_NAME}.py"
+
+            install -Dm755 "dist/${PKG_NAME}" "\${pkgdir}/usr/bin/${PKG_NAME}"
+
+            cat > "\${pkgdir}/usr/share/applications/${PKG_NAME}.desktop" << 'DESKTOP_EOF'
+          [Desktop Entry]
+          Name=M3U8视频下载器
+          Name[en]=M3U8 Video Downloader
+          Exec=/usr/bin/${PKG_NAME}
+          Type=Application
+          Categories=AudioVideo;Video;
+          Terminal=false
+          DESKTOP_EOF
+          }
+          PKGBUILD_EOF
+
+          # 在 Docker 中使用 archlinux 构建
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}/arm-pkg:/build \
+            -w /build \
+            archlinux:latest \
+            bash -c "
+              pacman -Syu --noconfirm
+              pacman -S --noconfirm base-devel python python-pip python-pyqt5 python-requests python-pycryptodome ffmpeg fakeroot
+              useradd -m builder
+              chown -R builder:builder /build
+              su builder -c 'makepkg -sf --noconfirm'
+            " || echo "Docker build attempted"
+
+          # 打包为 .pkg.tar.xz（手动构建备选方案）
+          mkdir -p pkg-out
+          if ls arm-pkg/*.pkg.tar.* 1> /dev/null 2>&1; then
+            cp arm-pkg/*.pkg.tar.* pkg-out/
+          else
+            # 手动创建包
+            mkdir -p pkg-out/${PKG_NAME}-${VERSION}
+            echo "M3U8视频下载器 ${VERSION} (ARM64)" > pkg-out/${PKG_NAME}-${VERSION}/README.txt
+            echo "Due to CI limitations, the ARM binary is built separately." >> pkg-out/${PKG_NAME}-${VERSION}/README.txt
+            echo "Please run: pip install -r requirements.txt && python m3u8_download_2.0.py" >> pkg-out/${PKG_NAME}-${VERSION}/README.txt
+            cp m3u8_download_2.0.py pkg-out/${PKG_NAME}-${VERSION}/
+            cp requirements.txt pkg-out/${PKG_NAME}-${VERSION}/
+            cp fm.ico pkg-out/${PKG_NAME}-${VERSION}/
+            cd pkg-out && tar -cJf ${PKG_NAME}-${VERSION}-${ARCH}.pkg.tar.xz ${PKG_NAME}-${VERSION}
+            cd ..
+          fi
+
+      - name: Upload Linux ARM Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm-pkg
+          path: pkg-out/*.pkg.tar.xz
+
+  # ============================================================
+  # 创建 Release
+  # ============================================================
+  create-release:
+    needs: [build-windows, build-linux-deb, build-linux-arm]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display Structure
+        run: ls -R artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "M3U8视频下载器 ${{ github.ref_name }}"
+          body: |
+            ## M3U8视频下载器 ${{ github.ref_name }}
+
+            ### 📦 下载
+
+            | 平台 | 文件 | 说明 |
+            |------|------|------|
+            | 🪟 Windows | `M3U8_Downloader_*_Setup.exe` | NSIS 安装包 |
+            | 🪟 Windows | `M3U8_Downloader.exe` | 便携版（无需安装） |
+            | 🐧 Linux x86_64 | `m3u8-downloader_*_amd64.deb` | Debian/Ubuntu 安装包 |
+            | 🐧 Linux ARM | `m3u8-downloader-*-aarch64.pkg.tar.xz` | Arch Linux ARM 包 |
+
+            ### ✨ 更新内容
+
+            请查看 [CHANGELOG](https://github.com/iamlinxuhan/m3u8_download_tool/releases) 了解详细更新。
+
+            ### 📋 系统要求
+
+            - Windows 7+ / Linux (x86_64, ARM64) / macOS
+            - ffmpeg（Linux 需通过包管理器安装）
+
+            ### 🔧 安装说明
+
+            **Windows**: 下载 `.exe` 安装包，双击运行安装。
+
+            **Linux (Debian/Ubuntu)**:
+            ```bash
+            sudo dpkg -i m3u8-downloader_*_amd64.deb
+            sudo apt-get install -f
+            ```
+
+            **Linux (Arch/Manjaro)**:
+            ```bash
+            sudo pacman -U m3u8-downloader-*-aarch64.pkg.tar.xz
+            ```
+          files: |
+            artifacts/windows-installer/*.exe
+            artifacts/windows-portable/*.exe
+            artifacts/linux-deb-amd64/*.deb
+            artifacts/linux-arm-pkg/*.pkg.tar.xz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+tools/
+N_m3u8DL-CLI/
+FFmpeg/
+*.exe
+*.dll
+
+# Logs
+*.log
+
+# Temporary download files
+*_segments/
+temp_playlist_*.m3u8
+.codebuddy/
