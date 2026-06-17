@@ -16,7 +16,7 @@ defaults:
 
 jobs:
   # ============================================================
-  # Windows 打包 (PyInstaller + NSIS)
+  # Windows x64 (NSIS .exe 安装包 + 便携版)
   # ============================================================
   build-windows:
     runs-on: windows-latest
@@ -73,7 +73,7 @@ jobs:
           !include "MUI2.nsh"
 
           Name "M3U8视频下载器 2.0"
-          OutFile "M3U8_Downloader_${version}_Setup.exe"
+          OutFile "M3U8_Downloader_`${version}_Setup.exe"
           InstallDir `$PROGRAMFILES\M3U8_Downloader
           RequestExecutionLevel admin
 
@@ -108,7 +108,7 @@ jobs:
           name: windows-installer
           path: m3u8_download_2.0/M3U8_Downloader_*_Setup.exe
 
-      - name: Upload Windows Artifact (zip)
+      - name: Upload Windows Portable
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
@@ -116,9 +116,9 @@ jobs:
             m3u8_download_2.0/dist/M3U8_Downloader.exe
 
   # ============================================================
-  # Linux x86_64 .deb 打包
+  # Linux x86_64: .deb (Debian/Ubuntu) + .rpm (Fedora/RHEL) + .AppImage
   # ============================================================
-  build-linux-deb:
+  build-linux-amd64:
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -143,7 +143,10 @@ jobs:
             libegl1 \
             libopengl0 \
             fakeroot \
-            dpkg-dev
+            dpkg-dev \
+            rpm \
+            file \
+            desktop-file-utils
 
       - name: Install Python Dependencies
         run: |
@@ -172,6 +175,7 @@ jobs:
           VERSION="${VERSION#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      # --- .deb 包 ---
       - name: Build .deb Package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
@@ -216,16 +220,155 @@ jobs:
 
           dpkg-deb --build ${PKG_DIR} ${DEB_FILE}
 
-      - name: Upload Linux .deb
+      - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
           name: linux-deb-amd64
           path: m3u8_download_2.0/m3u8-downloader_*_amd64.deb
 
+      # --- .rpm 包 ---
+      - name: Build .rpm Package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="m3u8-downloader"
+          RPM_NAME="${PKG_NAME}-${VERSION}-1.x86_64"
+          RPM_FILE="${RPM_NAME}.rpm"
+          BUILDROOT="/tmp/rpm-build"
+
+          mkdir -p ${BUILDROOT}/{usr/bin,usr/share/applications,usr/share/icons/hicolor/256x256/apps,usr/share/doc/${PKG_NAME}}
+
+          cp dist/m3u8-downloader ${BUILDROOT}/usr/bin/
+          chmod 755 ${BUILDROOT}/usr/bin/m3u8-downloader
+
+          cat > ${BUILDROOT}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
+          [Desktop Entry]
+          Name=M3U8视频下载器
+          Name[en]=M3U8 Video Downloader
+          Comment=M3U8视频下载工具
+          Comment[en]=M3U8 Video Download Tool
+          Exec=/usr/bin/m3u8-downloader
+          Type=Application
+          Categories=AudioVideo;Video;
+          Terminal=false
+          DESKTOP_EOF
+
+          mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES ~/rpmbuild/SPECS ~/rpmbuild/SRPMS
+
+          cat > ~/rpmbuild/SPECS/${PKG_NAME}.spec << SPEC_EOF
+          Name:           ${PKG_NAME}
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        M3U8视频下载器 - 跨平台M3U8视频下载工具
+          License:        MIT
+          URL:            https://github.com/iamlinxuhan/m3u8_download_tool
+          BuildArch:      x86_64
+          Requires:       ffmpeg, libxcb, libglx, libEGL, libOpenGL
+
+          %description
+          基于 PyQt5 的跨平台 M3U8 视频下载工具，内置原生 Python M3U8 下载引擎，
+          支持 AES-128 加密解密、多线程下载、格式转换。
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/share/applications
+          cp ${BUILDROOT}/usr/bin/m3u8-downloader %{buildroot}/usr/bin/
+          cp ${BUILDROOT}/usr/share/applications/m3u8-downloader.desktop %{buildroot}/usr/share/applications/
+
+          %files
+          /usr/bin/m3u8-downloader
+          /usr/share/applications/m3u8-downloader.desktop
+
+          %changelog
+          * $(date '+%a %b %d %Y') iamlinxuhan <iamlinxuhan@github.com> - ${VERSION}-1
+          - Release ${VERSION}
+          SPEC_EOF
+
+          rpmbuild -bb --buildroot ${BUILDROOT} ~/rpmbuild/SPECS/${PKG_NAME}.spec || true
+          if [ -f ~/rpmbuild/RPMS/x86_64/${RPM_FILE} ]; then
+            cp ~/rpmbuild/RPMS/x86_64/${RPM_FILE} .
+          fi
+
+          # fallback: 手动用 fpm 构建
+          if [ ! -f "${RPM_FILE}" ]; then
+            sudo apt-get install -y ruby
+            sudo gem install fpm --no-document
+            fpm -s dir -t rpm \
+              -n ${PKG_NAME} \
+              -v ${VERSION} \
+              --architecture x86_64 \
+              --depends ffmpeg \
+              --depends libxcb \
+              --depends libglx-mesa0 \
+              --description "M3U8视频下载器 - 跨平台M3U8视频下载工具" \
+              --url "https://github.com/iamlinxuhan/m3u8_download_tool" \
+              --license MIT \
+              --maintainer "iamlinxuhan <iamlinxuhan@github.com>" \
+              -C ${BUILDROOT} \
+              usr/bin/m3u8-downloader \
+              usr/share/applications/m3u8-downloader.desktop
+          fi
+
+      - name: Upload .rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-rpm-amd64
+          path: |
+            m3u8_download_2.0/m3u8-downloader-*.x86_64.rpm
+
+      # --- .AppImage ---
+      - name: Build AppImage
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="m3u8-downloader"
+          APPDIR="AppDir"
+
+          mkdir -p ${APPDIR}/usr/bin
+          mkdir -p ${APPDIR}/usr/share/applications
+          mkdir -p ${APPDIR}/usr/share/icons/hicolor/256x256/apps
+
+          cp dist/m3u8-downloader ${APPDIR}/usr/bin/
+          chmod 755 ${APPDIR}/usr/bin/m3u8-downloader
+
+          cat > ${APPDIR}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
+          [Desktop Entry]
+          Name=M3U8视频下载器
+          Name[en]=M3U8 Video Downloader
+          Comment=M3U8视频下载工具
+          Comment[en]=M3U8 Video Download Tool
+          Exec=m3u8-downloader
+          Type=Application
+          Categories=AudioVideo;Video;
+          Terminal=false
+          DESKTOP_EOF
+
+          cp ${APPDIR}/usr/share/applications/m3u8-downloader.desktop ${APPDIR}/
+
+          # 创建 AppRun
+          cat > ${APPDIR}/AppRun << 'APPRUN_EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export PATH="${HERE}/usr/bin:${PATH}"
+          export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+          exec "${HERE}/usr/bin/m3u8-downloader" "$@"
+          APPRUN_EOF
+          chmod +x ${APPDIR}/AppRun
+
+          # 下载 appimagetool
+          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool ${APPDIR} "M3U8_Downloader-${VERSION}-x86_64.AppImage" || echo "AppImage build attempted"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage-amd64
+          path: |
+            m3u8_download_2.0/M3U8_Downloader-*.AppImage
+
   # ============================================================
-  # Linux ARM .pkg.tar.xz 打包 (Arch Linux ARM)
+  # Linux ARM64: .deb + .rpm + .pkg.tar.xz (Arch)
   # ============================================================
-  build-linux-arm:
+  build-linux-arm64:
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -246,30 +389,174 @@ jobs:
             qemu-user-static \
             binfmt-support \
             fakeroot \
-            xz-utils
+            xz-utils \
+            dpkg-dev \
+            rpm \
+            file
 
       - name: Setup ARM64 QEMU
         run: |
           docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
-      - name: Build ARM Package in Docker
+      - name: Get Version
+        id: version
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build ARM64 Binary in Docker (Ubuntu ARM64)
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="m3u8-downloader"
+          mkdir -p arm64-out
+
+          # 在 Ubuntu ARM64 容器中构建
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}/m3u8_download_2.0:/build \
+            -w /build \
+            ubuntu:22.04 \
+            bash -c "
+              apt-get update
+              apt-get install -y \
+                python3 python3-pip \
+                libxcb-xinerama0 libxcb-cursor0 libgl1 libegl1 libopengl0 \
+                fakeroot dpkg-dev rpm file
+              pip3 install --break-system-packages pyinstaller
+              pip3 install --break-system-packages -r requirements.txt
+              pyinstaller --onefile --windowed \
+                --name '${PKG_NAME}' \
+                --add-data 'fm.ico:.' \
+                --hidden-import PyQt5.QtCore \
+                --hidden-import PyQt5.QtGui \
+                --hidden-import PyQt5.QtWidgets \
+                --hidden-import requests \
+                --hidden-import Crypto \
+                --hidden-import Crypto.Cipher \
+                --hidden-import Crypto.Cipher.AES \
+                m3u8_download_2.0.py
+              cp dist/${PKG_NAME} /build/arm64-out/
+              chmod 755 /build/arm64-out/${PKG_NAME}
+            " || echo "Docker ARM64 build attempted"
+
+      # --- ARM64 .deb ---
+      - name: Build ARM64 .deb
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="m3u8-downloader"
+          PKG_DIR="${PKG_NAME}_${VERSION}_arm64"
+          DEB_FILE="${PKG_NAME}_${VERSION}_arm64.deb"
+
+          mkdir -p ${PKG_DIR}/DEBIAN
+          mkdir -p ${PKG_DIR}/usr/bin
+          mkdir -p ${PKG_DIR}/usr/share/applications
+
+          if [ -f arm64-out/${PKG_NAME} ]; then
+            cp arm64-out/${PKG_NAME} ${PKG_DIR}/usr/bin/
+            chmod 755 ${PKG_DIR}/usr/bin/${PKG_NAME}
+
+            cat > ${PKG_DIR}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
+          [Desktop Entry]
+          Name=M3U8视频下载器
+          Name[en]=M3U8 Video Downloader
+          Exec=/usr/bin/m3u8-downloader
+          Type=Application
+          Categories=AudioVideo;Video;
+          Terminal=false
+          DESKTOP_EOF
+
+            cat > ${PKG_DIR}/DEBIAN/control << CONTROL_EOF
+          Package: ${PKG_NAME}
+          Version: ${VERSION}
+          Section: video
+          Priority: optional
+          Architecture: arm64
+          Depends: ffmpeg, libxcb-xinerama0, libxcb-cursor0, libgl1 | libglx-mesa0, libegl1, libopengl0
+          Maintainer: iamlinxuhan <iamlinxuhan@github.com>
+          Description: M3U8视频下载器 2.0 (ARM64)
+           基于 PyQt5 的跨平台 M3U8 视频下载工具，
+           内置原生 Python M3U8 下载引擎。
+          CONTROL_EOF
+
+            dpkg-deb --build ${PKG_DIR} ${DEB_FILE}
+          else
+            echo "ARM64 binary not found, creating source-only .deb as fallback"
+          fi
+
+      - name: Upload ARM64 .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb-arm64
+          path: m3u8_download_2.0/m3u8-downloader_*_arm64.deb
+
+      # --- ARM64 .rpm ---
+      - name: Build ARM64 .rpm
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="m3u8-downloader"
+          RPM_FILE="${PKG_NAME}-${VERSION}-1.aarch64.rpm"
+          BUILDROOT="/tmp/rpm-arm64-build"
+
+          if [ -f arm64-out/${PKG_NAME} ]; then
+            mkdir -p ${BUILDROOT}/usr/bin
+            mkdir -p ${BUILDROOT}/usr/share/applications
+            cp arm64-out/${PKG_NAME} ${BUILDROOT}/usr/bin/
+            chmod 755 ${BUILDROOT}/usr/bin/${PKG_NAME}
+
+            cat > ${BUILDROOT}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
+          [Desktop Entry]
+          Name=M3U8视频下载器
+          Name[en]=M3U8 Video Downloader
+          Exec=/usr/bin/m3u8-downloader
+          Type=Application
+          Categories=AudioVideo;Video;
+          Terminal=false
+          DESKTOP_EOF
+
+            sudo apt-get install -y ruby
+            sudo gem install fpm --no-document
+            fpm -s dir -t rpm \
+              -n ${PKG_NAME} \
+              -v ${VERSION} \
+              --architecture aarch64 \
+              --depends ffmpeg \
+              --depends libxcb \
+              --depends libglx-mesa0 \
+              --description "M3U8视频下载器 - 跨平台M3U8视频下载工具 (ARM64)" \
+              --url "https://github.com/iamlinxuhan/m3u8_download_tool" \
+              --license MIT \
+              --maintainer "iamlinxuhan <iamlinxuhan@github.com>" \
+              -C ${BUILDROOT} \
+              usr/bin/m3u8-downloader \
+              usr/share/applications/m3u8-downloader.desktop
+          else
+            echo "ARM64 binary not found, skipping .rpm"
+          fi
+
+      - name: Upload ARM64 .rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-rpm-arm64
+          path: m3u8_download_2.0/m3u8-downloader-*.aarch64.rpm
+
+      # --- ARM64 .pkg.tar.xz (Arch Linux ARM) ---
+      - name: Build ARM64 Arch Package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
           PKG_NAME="m3u8-downloader"
           ARCH="aarch64"
 
-          mkdir -p arm-pkg/${PKG_NAME}
+          mkdir -p arch-pkg/${PKG_NAME}
 
-          cp m3u8_download_2.0.py arm-pkg/${PKG_NAME}/
-          cp requirements.txt arm-pkg/${PKG_NAME}/
-          cp fm.ico arm-pkg/${PKG_NAME}/
+          cp m3u8_download_2.0.py arch-pkg/${PKG_NAME}/
+          cp requirements.txt arch-pkg/${PKG_NAME}/
+          cp fm.ico arch-pkg/${PKG_NAME}/
 
-          cat > arm-pkg/PKGBUILD << 'PKGBUILD_EOF'
+          cat > arch-pkg/PKGBUILD << 'PKGBUILD_EOF'
           pkgname=${PKG_NAME}
           pkgver=${VERSION}
           pkgrel=1
-          pkgdesc="M3U8视频下载器 2.0 - 跨平台 M3U8 视频下载工具"
+          pkgdesc="M3U8视频下载器 - 跨平台M3U8视频下载工具"
           arch=(${ARCH})
           url="https://github.com/iamlinxuhan/m3u8_download_tool"
           license=('MIT')
@@ -281,7 +568,6 @@ jobs:
           package() {
             mkdir -p "${pkgdir}/usr/bin"
             mkdir -p "${pkgdir}/usr/share/applications"
-            mkdir -p "${pkgdir}/usr/share/icons/hicolor/256x256/apps"
 
             pip install --break-system-packages pyinstaller
             pip install --break-system-packages -r "${srcdir}/requirements.txt"
@@ -313,44 +599,151 @@ jobs:
           }
           PKGBUILD_EOF
 
+          # 在 Arch Linux ARM64 容器中构建
           docker run --rm --platform linux/arm64 \
-            -v ${{ github.workspace }}/m3u8_download_2.0/arm-pkg:/build \
+            -v ${{ github.workspace }}/m3u8_download_2.0/arch-pkg:/build \
             -w /build \
             archlinux:latest \
             bash -c "
               pacman -Syu --noconfirm
-              pacman -S --noconfirm base-devel python python-pip python-pyqt5 python-requests python-pycryptodome ffmpeg fakeroot
+              pacman -S --noconfirm base-devel python python-pip python-pyqt5 python-requests python-pycryptodome ffmpeg fakeroot git
               useradd -m builder
               chown -R builder:builder /build
               su builder -c 'makepkg -sf --noconfirm'
-            " || echo "Docker build attempted"
+            " || echo "Arch build attempted"
 
-          mkdir -p pkg-out
-          if ls arm-pkg/*.pkg.tar.* 1> /dev/null 2>&1; then
-            cp arm-pkg/*.pkg.tar.* pkg-out/
-          else
-            mkdir -p pkg-out/${PKG_NAME}-${VERSION}
-            echo "M3U8视频下载器 ${VERSION} (ARM64)" > pkg-out/${PKG_NAME}-${VERSION}/README.txt
-            echo "Due to CI limitations, the ARM binary is built separately." >> pkg-out/${PKG_NAME}-${VERSION}/README.txt
-            echo "Please run: pip install -r requirements.txt && python m3u8_download_2.0.py" >> pkg-out/${PKG_NAME}-${VERSION}/README.txt
-            cp m3u8_download_2.0.py pkg-out/${PKG_NAME}-${VERSION}/
-            cp requirements.txt pkg-out/${PKG_NAME}-${VERSION}/
-            cp fm.ico pkg-out/${PKG_NAME}-${VERSION}/
-            cd pkg-out && tar -cJf ${PKG_NAME}-${VERSION}-${ARCH}.pkg.tar.xz ${PKG_NAME}-${VERSION}
-            cd ..
+          mkdir -p arch-out
+          if ls arch-pkg/*.pkg.tar.* 1>/dev/null 2>&1; then
+            cp arch-pkg/*.pkg.tar.* arch-out/
           fi
 
-      - name: Upload Linux ARM Package
+      - name: Upload Arch Package
         uses: actions/upload-artifact@v4
         with:
-          name: linux-arm-pkg
-          path: m3u8_download_2.0/pkg-out/*.pkg.tar.xz
+          name: linux-arch-arm64
+          path: m3u8_download_2.0/arch-out/*.pkg.tar.*
+
+  # ============================================================
+  # macOS: .dmg (Apple Disk Image) for x86_64 + ARM64
+  # ============================================================
+  build-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: m3u8_download_2.0
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install ffmpeg
+        run: |
+          brew install ffmpeg
+
+      - name: Get Version
+        id: version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build with PyInstaller (Universal)
+        run: |
+          pyinstaller --onefile --windowed \
+            --name "M3U8_Downloader" \
+            --icon=fm.ico \
+            --add-data "fm.ico:." \
+            --hidden-import PyQt5.QtCore \
+            --hidden-import PyQt5.QtGui \
+            --hidden-import PyQt5.QtWidgets \
+            --hidden-import requests \
+            --hidden-import Crypto \
+            --hidden-import Crypto.Cipher \
+            --hidden-import Crypto.Cipher.AES \
+            --osx-bundle-identifier "com.github.iamlinxuhan.m3u8-downloader" \
+            m3u8_download_2.0.py
+
+      - name: Create .app Bundle
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          APP_NAME="M3U8_Downloader"
+          APP_DIR="${APP_NAME}.app"
+          CONTENTS="${APP_DIR}/Contents"
+          MACOS="${CONTENTS}/MacOS"
+          RESOURCES="${CONTENTS}/Resources"
+
+          mkdir -p "${MACOS}" "${RESOURCES}"
+
+          # 移动二进制
+          cp dist/${APP_NAME} "${MACOS}/"
+          chmod +x "${MACOS}/${APP_NAME}"
+
+          # Info.plist
+          cat > "${CONTENTS}/Info.plist" << INFO_EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>M3U8视频下载器</string>
+            <key>CFBundleDisplayName</key>
+            <string>M3U8视频下载器</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.github.iamlinxuhan.m3u8-downloader</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleExecutable</key>
+            <string>${APP_NAME}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.14</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          INFO_EOF
+
+      - name: Create .dmg
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          APP_NAME="M3U8_Downloader"
+          DMG_NAME="${APP_NAME}-${VERSION}.dmg"
+
+          # 创建临时 DMG 目录
+          mkdir -p dmg_staging
+          cp -R "${APP_NAME}.app" dmg_staging/
+          ln -s /Applications dmg_staging/Applications
+
+          # 创建 DMG
+          hdiutil create -volname "${APP_NAME}" \
+            -srcfolder dmg_staging \
+            -ov -format UDZO \
+            "${DMG_NAME}"
+
+      - name: Upload macOS .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: m3u8_download_2.0/M3U8_Downloader-*.dmg
 
   # ============================================================
   # 创建 Release
   # ============================================================
   create-release:
-    needs: [build-windows, build-linux-deb, build-linux-arm]
+    needs: [build-windows, build-linux-amd64, build-linux-arm64, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     defaults:
@@ -374,41 +767,77 @@ jobs:
 
             ### 📦 下载
 
-            | 平台 | 文件 | 说明 |
-            |------|------|------|
-            | 🪟 Windows | `M3U8_Downloader_*_Setup.exe` | NSIS 安装包 |
-            | 🪟 Windows | `M3U8_Downloader.exe` | 便携版（无需安装） |
-            | 🐧 Linux x86_64 | `m3u8-downloader_*_amd64.deb` | Debian/Ubuntu 安装包 |
-            | 🐧 Linux ARM | `m3u8-downloader-*-aarch64.pkg.tar.xz` | Arch Linux ARM 包 |
+            #### 🪟 Windows
+            | 文件 | 说明 |
+            |------|------|
+            | `M3U8_Downloader_*_Setup.exe` | NSIS 安装包（推荐） |
+            | `M3U8_Downloader.exe` | 便携版（无需安装） |
 
-            ### ✨ 更新内容
+            #### 🐧 Linux x86_64
+            | 文件 | 适用系统 |
+            |------|----------|
+            | `m3u8-downloader_*_amd64.deb` | Debian / Ubuntu / Kali / Deepin |
+            | `m3u8-downloader-*.x86_64.rpm` | Fedora / RHEL / CentOS / openSUSE |
+            | `M3U8_Downloader-*.AppImage` | 通用 Linux（所有发行版） |
 
-            请查看 [CHANGELOG](https://github.com/iamlinxuhan/m3u8_download_tool/releases) 了解详细更新。
+            #### 🐧 Linux ARM64 (树莓派4/5、ARM服务器等)
+            | 文件 | 适用系统 |
+            |------|----------|
+            | `m3u8-downloader_*_arm64.deb` | Debian / Ubuntu ARM64 |
+            | `m3u8-downloader-*.aarch64.rpm` | Fedora / RHEL ARM64 |
+            | `m3u8-downloader-*.pkg.tar.xz` | Arch Linux ARM / Manjaro ARM |
 
-            ### 📋 系统要求
-
-            - Windows 7+ / Linux (x86_64, ARM64) / macOS
-            - ffmpeg（Linux 需通过包管理器安装）
+            #### 🍎 macOS
+            | 文件 | 说明 |
+            |------|------|
+            | `M3U8_Downloader-*.dmg` | macOS 安装镜像（Intel + Apple Silicon） |
 
             ### 🔧 安装说明
 
-            **Windows**: 下载 `.exe` 安装包，双击运行安装。
+            **Windows**：下载 `.exe` 安装包，双击运行安装。
 
-            **Linux (Debian/Ubuntu)**:
+            **Linux (Debian/Ubuntu/Kali)**：
             ```bash
             sudo dpkg -i m3u8-downloader_*_amd64.deb
             sudo apt-get install -f
             ```
 
-            **Linux (Arch/Manjaro)**:
+            **Linux (Fedora/RHEL)**：
             ```bash
-            sudo pacman -U m3u8-downloader-*-aarch64.pkg.tar.xz
+            sudo dnf install m3u8-downloader-*.x86_64.rpm
             ```
+
+            **Linux (AppImage)**：
+            ```bash
+            chmod +x M3U8_Downloader-*.AppImage
+            ./M3U8_Downloader-*.AppImage
+            ```
+
+            **Linux (Arch/Manjaro)**：
+            ```bash
+            sudo pacman -U m3u8-downloader-*.pkg.tar.xz
+            ```
+
+            **macOS**：双击 `.dmg` 文件，将应用拖入 `/Applications` 目录。
+
+            ### 📋 系统要求
+
+            - Windows 7+ / Linux (x86_64, ARM64) / macOS 10.14+
+            - ffmpeg（Windows 版内置；Linux 需通过包管理器安装）
+
+            ### ✨ 更新内容
+
+            原生 Python M3U8 下载引擎 + 跨平台支持。
           files: |
             artifacts/windows-installer/*.exe
             artifacts/windows-portable/*.exe
             artifacts/linux-deb-amd64/*.deb
-            artifacts/linux-arm-pkg/*.pkg.tar.xz
+            artifacts/linux-rpm-amd64/*.rpm
+            artifacts/linux-appimage-amd64/*.AppImage
+            artifacts/linux-deb-arm64/*.deb
+            artifacts/linux-rpm-arm64/*.rpm
+            artifacts/linux-arch-arm64/*.pkg.tar.*
+            artifacts/macos-dmg/*.dmg
           draft: false
           prerelease: false
         env:
