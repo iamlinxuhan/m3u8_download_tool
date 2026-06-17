@@ -6,12 +6,19 @@ on:
       - 'v*'
   workflow_dispatch:
 
+defaults:
+  run:
+    working-directory: m3u8_download_2.0
+
 jobs:
   # ============================================================
   # Windows 打包 (PyInstaller + NSIS)
   # ============================================================
   build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: m3u8_download_2.0
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -54,7 +61,7 @@ jobs:
         run: |
           Invoke-WebRequest -Uri "https://sourceforge.net/projects/nsis/files/NSIS%203/3.09/nsis-3.09.zip/download" -OutFile nsis.zip
           Expand-Archive -Path nsis.zip -DestinationPath nsis
-          echo "${{ github.workspace }}\nsis\nsis-3.09" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "${{ github.workspace }}\m3u8_download_2.0\nsis\nsis-3.09" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Create NSIS Installer Script
         run: |
@@ -96,20 +103,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: M3U8_Downloader_*_Setup.exe
+          path: m3u8_download_2.0/M3U8_Downloader_*_Setup.exe
 
       - name: Upload Windows Artifact (zip)
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
           path: |
-            dist/M3U8_Downloader.exe
+            m3u8_download_2.0/dist/M3U8_Downloader.exe
 
   # ============================================================
   # Linux x86_64 .deb 打包
   # ============================================================
   build-linux-deb:
     runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: m3u8_download_2.0
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -166,18 +176,15 @@ jobs:
           PKG_DIR="${PKG_NAME}_${VERSION}_amd64"
           DEB_FILE="${PKG_NAME}_${VERSION}_amd64.deb"
 
-          # 创建 deb 目录结构
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
           mkdir -p ${PKG_DIR}/usr/share/applications
           mkdir -p ${PKG_DIR}/usr/share/icons/hicolor/256x256/apps
           mkdir -p ${PKG_DIR}/usr/share/doc/${PKG_NAME}
 
-          # 复制文件
           cp dist/m3u8-downloader ${PKG_DIR}/usr/bin/
           chmod 755 ${PKG_DIR}/usr/bin/m3u8-downloader
 
-          # 创建 .desktop 文件
           cat > ${PKG_DIR}/usr/share/applications/m3u8-downloader.desktop << 'DESKTOP_EOF'
           [Desktop Entry]
           Name=M3U8视频下载器
@@ -190,7 +197,6 @@ jobs:
           Terminal=false
           DESKTOP_EOF
 
-          # 创建 DEBIAN/control
           cat > ${PKG_DIR}/DEBIAN/control << CONTROL_EOF
           Package: ${PKG_NAME}
           Version: ${VERSION}
@@ -205,20 +211,22 @@ jobs:
            支持 AES-128 加密解密、多线程下载、格式转换。
           CONTROL_EOF
 
-          # 构建 .deb
           dpkg-deb --build ${PKG_DIR} ${DEB_FILE}
 
       - name: Upload Linux .deb
         uses: actions/upload-artifact@v4
         with:
           name: linux-deb-amd64
-          path: m3u8-downloader_*_amd64.deb
+          path: m3u8_download_2.0/m3u8-downloader_*_amd64.deb
 
   # ============================================================
   # Linux ARM .pkg.tar.xz 打包 (Arch Linux ARM)
   # ============================================================
   build-linux-arm:
     runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: m3u8_download_2.0
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -248,16 +256,13 @@ jobs:
           PKG_NAME="m3u8-downloader"
           ARCH="aarch64"
 
-          # 创建 PKGBUILD 风格的目录
           mkdir -p arm-pkg/${PKG_NAME}
 
-          # 复制源码
           cp m3u8_download_2.0.py arm-pkg/${PKG_NAME}/
           cp requirements.txt arm-pkg/${PKG_NAME}/
           cp fm.ico arm-pkg/${PKG_NAME}/
 
-          # 创建 PKGBUILD
-          cat > arm-pkg/PKGBUILD << PKGBUILD_EOF
+          cat > arm-pkg/PKGBUILD << 'PKGBUILD_EOF'
           pkgname=${PKG_NAME}
           pkgver=${VERSION}
           pkgrel=1
@@ -271,29 +276,29 @@ jobs:
           sha256sums=('SKIP' 'SKIP' 'SKIP')
 
           package() {
-            mkdir -p "\${pkgdir}/usr/bin"
-            mkdir -p "\${pkgdir}/usr/share/applications"
-            mkdir -p "\${pkgdir}/usr/share/icons/hicolor/256x256/apps"
+            mkdir -p "${pkgdir}/usr/bin"
+            mkdir -p "${pkgdir}/usr/share/applications"
+            mkdir -p "${pkgdir}/usr/share/icons/hicolor/256x256/apps"
 
             pip install --break-system-packages pyinstaller
-            pip install --break-system-packages -r "\${srcdir}/requirements.txt"
+            pip install --break-system-packages -r "${srcdir}/requirements.txt"
 
-            cd "\${srcdir}"
-            pyinstaller --onefile --windowed \\
-              --name "${PKG_NAME}" \\
-              --add-data "fm.ico:." \\
-              --hidden-import PyQt5.QtCore \\
-              --hidden-import PyQt5.QtGui \\
-              --hidden-import PyQt5.QtWidgets \\
-              --hidden-import requests \\
-              --hidden-import Crypto \\
-              --hidden-import Crypto.Cipher \\
-              --hidden-import Crypto.Cipher.AES \\
+            cd "${srcdir}"
+            pyinstaller --onefile --windowed \
+              --name "${PKG_NAME}" \
+              --add-data "fm.ico:." \
+              --hidden-import PyQt5.QtCore \
+              --hidden-import PyQt5.QtGui \
+              --hidden-import PyQt5.QtWidgets \
+              --hidden-import requests \
+              --hidden-import Crypto \
+              --hidden-import Crypto.Cipher \
+              --hidden-import Crypto.Cipher.AES \
               "${PKG_NAME}.py"
 
-            install -Dm755 "dist/${PKG_NAME}" "\${pkgdir}/usr/bin/${PKG_NAME}"
+            install -Dm755 "dist/${PKG_NAME}" "${pkgdir}/usr/bin/${PKG_NAME}"
 
-            cat > "\${pkgdir}/usr/share/applications/${PKG_NAME}.desktop" << 'DESKTOP_EOF'
+            cat > "${pkgdir}/usr/share/applications/${PKG_NAME}.desktop" << 'DESKTOP_EOF'
           [Desktop Entry]
           Name=M3U8视频下载器
           Name[en]=M3U8 Video Downloader
@@ -305,9 +310,8 @@ jobs:
           }
           PKGBUILD_EOF
 
-          # 在 Docker 中使用 archlinux 构建
           docker run --rm --platform linux/arm64 \
-            -v ${{ github.workspace }}/arm-pkg:/build \
+            -v ${{ github.workspace }}/m3u8_download_2.0/arm-pkg:/build \
             -w /build \
             archlinux:latest \
             bash -c "
@@ -318,12 +322,10 @@ jobs:
               su builder -c 'makepkg -sf --noconfirm'
             " || echo "Docker build attempted"
 
-          # 打包为 .pkg.tar.xz（手动构建备选方案）
           mkdir -p pkg-out
           if ls arm-pkg/*.pkg.tar.* 1> /dev/null 2>&1; then
             cp arm-pkg/*.pkg.tar.* pkg-out/
           else
-            # 手动创建包
             mkdir -p pkg-out/${PKG_NAME}-${VERSION}
             echo "M3U8视频下载器 ${VERSION} (ARM64)" > pkg-out/${PKG_NAME}-${VERSION}/README.txt
             echo "Due to CI limitations, the ARM binary is built separately." >> pkg-out/${PKG_NAME}-${VERSION}/README.txt
@@ -339,7 +341,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-arm-pkg
-          path: pkg-out/*.pkg.tar.xz
+          path: m3u8_download_2.0/pkg-out/*.pkg.tar.xz
 
   # ============================================================
   # 创建 Release
