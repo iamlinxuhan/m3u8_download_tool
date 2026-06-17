@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: read
+
 defaults:
   run:
     working-directory: m3u8_download_2.0
@@ -362,7 +366,7 @@ jobs:
         run: ls -R artifacts/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: "M3U8视频下载器 ${{ github.ref_name }}"
           body: |
